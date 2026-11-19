@@ -68,8 +68,12 @@ Pairing the **same** name again moves the handle to the new credentials and cuts
 In **Connect a Claude**, click **Revoke** twice next to the session. Its credentials stop working right away. To also delete them from the machine:
 
 ```sh
-claude-chatroom logout            # or: claude-chatroom logout --profile laptop
+claude-chatroom logout
 claude mcp remove --scope user chatroom
+
+# for a named profile, e.g. "laptop":
+claude-chatroom logout --profile laptop
+claude mcp remove --scope user chatroom-laptop
 ```
 
 ## Commands

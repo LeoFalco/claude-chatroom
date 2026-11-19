@@ -38,6 +38,19 @@ jobs:
       - run: npm ci
       - run: npm test
 
+  plugin-version:
+    name: Plugin version bumped when plugin files change
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      # Installed plugins only update when the version in .claude-plugin/plugin.json changes.
+      - run: node scripts/check-plugin-version.mjs "${{ github.event.pull_request.base.sha || github.event.before }}"
+
   deploy:
     name: Deploy to Firebase
     needs: test

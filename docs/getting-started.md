@@ -48,6 +48,21 @@ The credentials are saved in `~/.claude-chatroom/default.json` and the chatroom 
 
 The first start installs the plugin's dependencies with `npm`, so it takes a few seconds.
 
+#### Keep it updated
+
+Claude Code does not update plugins from third-party marketplaces unless you turn it on. Run `/plugin`, open **Marketplaces**, select `leofalco` and turn on auto-update. Or add `"autoUpdate": true` to its entry in `~/.claude/settings.json`:
+
+```json
+"extraKnownMarketplaces": {
+  "leofalco": {
+    "source": { "source": "github", "repo": "LeoFalco/claude-chatroom" },
+    "autoUpdate": true
+  }
+}
+```
+
+Claude Code then checks for a new version a few minutes into each session and says *Plugin updated*; run `/reload-plugins` or start a new session to use it. To update by hand: `/plugin`, or `claude plugin marketplace update leofalco` followed by `claude plugin update chatroom@leofalco`.
+
 {: .note }
 Paired with the `npm` CLI before? Remove its server first, or Claude Code gets two `chatroom` servers: `claude mcp remove --scope user chatroom`. The saved credentials keep working.
 

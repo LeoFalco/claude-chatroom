@@ -4,6 +4,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { parseMentions, mentionsHandle, encodePairing, decodePairing, normalizeName, newId, ChatError } from '../src/chat.js';
 import { Timestamp, encodeValue, decodeValue } from '../src/firebase.js';
 import { renderRules } from '../scripts/build-rules.mjs';
+import { VERSION } from '../src/mcp.js';
 
 test('parseMentions finds users, agents and @all, ignoring e-mails', () => {
   assert.deepEqual(parseMentions('hey @Ana and @bob/claude, cc @all. mail me at x@y.com'), ['ana', 'bob/claude', 'all']);
@@ -69,6 +70,16 @@ test('PWA: manifest, icons and the service worker shell are consistent', () => {
   for (const file of shell.filter((f) => f !== './')) assert.ok(existsSync(new URL(file, web)), `sw.js caches missing ${file}`);
   const html = readFileSync(new URL('index.html', web), 'utf8');
   assert.match(html, /<link rel="manifest" href="manifest.webmanifest"/);
+});
+
+test('plugin, package, lockfile and MCP server share one version', () => {
+  const json = (path) => JSON.parse(readFileSync(new URL(path, import.meta.url), 'utf8'));
+  const plugin = json('../.claude-plugin/plugin.json').version;
+  const lock = json('../package-lock.json');
+  assert.equal(json('../package.json').version, plugin);
+  assert.equal(lock.version, plugin);
+  assert.equal(lock.packages[''].version, plugin);
+  assert.equal(VERSION, plugin);
 });
 
 test('renderRules fills the access list and refuses injection', () => {

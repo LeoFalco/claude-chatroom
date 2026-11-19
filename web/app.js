@@ -54,13 +54,17 @@ const PAIRING_TTL_MS = 15 * 60_000;
 const state = {
   user: null,
   me: null, // { hid, handle }
-  rooms: new Map(), // name -> { topic, createdBy }
+  rooms: new Map(), // name -> { topic, createdBy }, only rooms you can see
+  invited: new Set(), // rooms you were invited to
   memberships: new Map(), // room -> lastReadAt (Timestamp)
+  roomWatch: new Map(), // room -> unsubscribe of its doc listener
+  roomInvites: [], // people invited to the current room
   unread: new Map(), // room -> count
   current: null,
   messages: [],
   replyTo: null,
-  handles: new Map(), // hid -> { status, lastSeen, kind }
+  handles: new Map(), // hid -> { status, lastSeen, kind }, only the handles being watched
+  handleWatch: new Map(), // hid -> unsubscribe
   unsubs: [],
   roomUnsubs: [],
   unreadWatch: new Map(), // room -> { since, unsub }
@@ -212,17 +216,24 @@ $('#handle-form').addEventListener('submit', async (e) => {
 });
 
 function teardown() {
-  for (const u of [...state.unsubs, ...state.roomUnsubs]) u();
+  for (const u of [...state.unsubs, ...state.roomUnsubs, ...state.roomWatch.values(), ...state.handleWatch.values()]) u();
   for (const w of state.unreadWatch.values()) w.unsub();
+  agentsUnsub?.();
+  agentsUnsub = null;
+  retries.clear();
   Object.assign(state, {
     me: null,
     rooms: new Map(),
+    invited: new Set(),
     memberships: new Map(),
+    roomWatch: new Map(),
+    roomInvites: [],
     unread: new Map(),
     current: null,
     messages: [],
     replyTo: null,
     handles: new Map(),
+    handleWatch: new Map(),
     unsubs: [],
     roomUnsubs: [],
     unreadWatch: new Map(),
@@ -242,22 +253,16 @@ function start(hid) {
     onSnapshot(doc(db, 'handles', hid), (d) => {
       if (document.activeElement !== $('#status-input')) $('#status-input').value = d.data()?.status ?? '';
     }),
-    onSnapshot(query(collection(db, 'rooms'), orderBy('__name__')), (snap) => {
-      state.rooms = new Map(snap.docs.map((d) => [d.id, d.data()]));
-      renderRooms();
-      if (state.current && state.rooms.has(state.current)) renderRoomHeader();
-    }),
     onSnapshot(query(collectionGroup(db, 'members'), where('hid', '==', hid)), (snap) => {
       state.memberships = new Map(snap.docs.map((d) => [d.data().room, d.data().lastReadAt]));
+      watchRooms();
       watchUnread();
       renderRooms();
       if (state.current) renderMembership();
     }),
-    onSnapshot(collection(db, 'handles'), (snap) => {
-      state.handles = new Map(snap.docs.map((d) => [d.id, d.data()]));
-      renderMembers();
-    }),
   );
+
+  watchInvites(hid);
 
   const fromHash = decodeURIComponent(location.hash.slice(1));
   if (NAME_RE.test(fromHash)) openRoom(fromHash);
@@ -269,6 +274,96 @@ function touch() {
   if (!state.me || Date.now() - lastTouch < 60_000) return;
   lastTouch = Date.now();
   updateDoc(doc(db, 'handles', state.me.hid), { lastSeen: serverTimestamp() }).catch(() => {});
+}
+
+/**
+ * Listeners can start from a local write the server has not committed yet (creating or joining
+ * a room), get denied and stop for good. Retries a few times, then gives up.
+ */
+const retries = new Map(); // key -> attempts
+function retryLater(key, fn) {
+  const n = (retries.get(key) ?? 0) + 1;
+  retries.set(key, n);
+  if (n <= 5) setTimeout(fn, 1000 * n);
+}
+
+/** Rooms are private: you see the rooms you were invited to and the ones you are in. */
+function watchInvites(hid) {
+  const unsub = onSnapshot(
+    query(collectionGroup(db, 'invites'), where('hid', '==', hid)),
+    (snap) => {
+      retries.delete('invites');
+      state.invited = new Set(snap.docs.map((d) => d.ref.parent.parent.id));
+      watchRooms();
+    },
+    // E.g. right after a deploy, while the index on invites.hid is still building.
+    (err) => {
+      console.warn('invites listener', err);
+      retryLater('invites', () => state.me?.hid === hid && watchInvites(hid));
+    },
+  );
+  state.unsubs.push(unsub);
+}
+
+/** One listener per room you can see; drops rooms you were removed from. */
+function watchRooms() {
+  const visible = new Set([...state.invited, ...state.memberships.keys()]);
+  for (const [room, unsub] of state.roomWatch) {
+    if (visible.has(room)) continue;
+    unsub();
+    state.roomWatch.delete(room);
+    state.rooms.delete(room);
+    if (room === state.current) closeRoom(`You no longer have access to #${room}.`);
+  }
+  for (const room of visible) {
+    if (state.roomWatch.has(room)) continue;
+    const forget = () => {
+      state.rooms.delete(room);
+      renderRooms();
+    };
+    const unsub = onSnapshot(
+      doc(db, 'rooms', room),
+      (d) => {
+        retries.delete(`room:${room}`);
+        if (!d.exists()) return forget();
+        state.rooms.set(room, d.data());
+        renderRooms();
+        if (room === state.current) renderRoomHeader();
+      },
+      () => {
+        state.roomWatch.delete(room);
+        forget();
+        retryLater(`room:${room}`, watchRooms);
+      },
+    );
+    state.roomWatch.set(room, unsub);
+  }
+  renderRooms();
+}
+
+/** Presence and status: one listener per handle shown (room members and your own Claude sessions). */
+function watchHandles() {
+  const wanted = new Set([...(state.members ?? []).map((m) => m.hid), ...agentHids]);
+  for (const [hid, unsub] of state.handleWatch) {
+    if (wanted.has(hid)) continue;
+    unsub();
+    state.handleWatch.delete(hid);
+    state.handles.delete(hid);
+  }
+  for (const hid of wanted) {
+    if (state.handleWatch.has(hid)) continue;
+    const unsub = onSnapshot(
+      doc(db, 'handles', hid),
+      (d) => {
+        if (d.exists()) state.handles.set(hid, d.data());
+        else state.handles.delete(hid);
+        renderMembers();
+        renderAgents();
+      },
+      (err) => console.warn('handle listener', hid, err),
+    );
+    state.handleWatch.set(hid, unsub);
+  }
 }
 
 /**
@@ -292,6 +387,7 @@ function watchUnread() {
     const unsub = onSnapshot(
       q,
       (snap) => {
+        retries.delete(`unread:${room}`);
         let n = 0;
         let mention = false;
         for (const d of snap.docs) {
@@ -304,7 +400,11 @@ function watchUnread() {
         else state.unread.delete(room);
         renderRooms();
       },
-      (err) => console.warn('unread listener', room, err),
+      (err) => {
+        console.warn('unread listener', room, err);
+        state.unreadWatch.delete(room);
+        retryLater(`unread:${room}`, watchUnread);
+      },
     );
     state.unreadWatch.set(room, { since, unsub });
   }
@@ -344,12 +444,29 @@ function renderRooms() {
   document.title = total ? `(${total}) Claude Chatroom` : 'Claude Chatroom';
 }
 
+function closeRoom(message) {
+  for (const u of state.roomUnsubs) u();
+  state.roomUnsubs = [];
+  state.current = null;
+  state.messages = [];
+  state.members = [];
+  state.roomInvites = [];
+  watchHandles();
+  history.replaceState(null, '', location.pathname + location.search);
+  $('#room-view').hidden = true;
+  $('#empty-state').hidden = false;
+  if ($('#people-dialog').open) $('#people-dialog').close();
+  renderRooms();
+  if (message) toast(message);
+}
+
 function openRoom(name) {
   for (const u of state.roomUnsubs) u();
   state.roomUnsubs = [];
   state.current = name;
   state.messages = [];
   state.members = [];
+  state.roomInvites = [];
   setReply(null);
   history.replaceState(null, '', `#${name}`);
   $('#empty-state').hidden = true;
@@ -368,13 +485,36 @@ function openRoom(name) {
         renderMessages();
         markRead();
       },
-      (err) => toast(permissionMessage(err)),
+      (err) => closeRoom(err?.code === 'permission-denied' ? `#${name} does not exist or you were not invited to it.` : permissionMessage(err)),
     ),
-    onSnapshot(collection(db, 'rooms', name, 'members'), (snap) => {
-      state.members = snap.docs.map((d) => d.data());
-      renderMembers();
-    }),
   );
+  watchRoomPart(name, 'members', (snap) => {
+    state.members = snap.docs.map((d) => d.data());
+    watchHandles();
+    renderMembers();
+    renderPeople();
+  });
+  watchRoomPart(name, 'invites', (snap) => {
+    state.roomInvites = snap.docs.map((d) => d.id);
+    renderPeople();
+  });
+}
+
+/** Listens to a room's members or invites while that room is open, retrying after errors. */
+function watchRoomPart(room, part, onNext) {
+  const key = `${part}:${room}`;
+  const unsub = onSnapshot(
+    collection(db, 'rooms', room, part),
+    (snap) => {
+      retries.delete(key);
+      onNext(snap);
+    },
+    (err) => {
+      console.warn(`${part} listener`, room, err);
+      retryLater(key, () => state.current === room && watchRoomPart(room, part, onNext));
+    },
+  );
+  state.roomUnsubs.push(unsub);
 }
 
 function renderRoomHeader() {
@@ -388,6 +528,7 @@ function renderMembership() {
   $('#composer').hidden = !joined;
   $('#join-bar').hidden = joined;
   $('#leave-room').hidden = !joined;
+  $('#open-people').hidden = !joined;
   $('#room-topic').disabled = !joined;
   $('#join-room-name').textContent = `#${state.current}`;
   if (joined) markRead();
@@ -491,10 +632,13 @@ async function joinRoom(name) {
     room: name,
     joinedAt: serverTimestamp(),
     lastReadAt,
+    invited: true,
   });
 }
 
-$('#join-room').addEventListener('click', () => joinRoom(state.current).catch((err) => toast(permissionMessage(err))));
+$('#join-room').addEventListener('click', () =>
+  joinRoom(state.current).catch((err) => toast(err?.code === 'permission-denied' ? 'You were not invited to this room.' : permissionMessage(err))),
+);
 
 $('#leave-room').addEventListener('click', async () => {
   await deleteDoc(doc(db, 'rooms', state.current, 'members', state.me.hid)).catch((err) => toast(permissionMessage(err)));
@@ -572,6 +716,8 @@ $('#room-form').addEventListener('submit', async (e) => {
   if (state.rooms.has(name)) return ($('#room-error').textContent = `#${name} already exists.`);
   const batch = writeBatch(db);
   batch.set(doc(db, 'rooms', name), { topic: $('#room-topic-input').value.slice(0, 500), createdBy: state.me.handle, createdAt: serverTimestamp() });
+  // Rooms are private: the creator invites themselves (and so their Claude sessions).
+  batch.set(doc(db, 'rooms', name, 'invites', state.me.hid), { hid: state.me.hid, invitedBy: state.me.handle, invitedAt: serverTimestamp() });
   batch.set(doc(db, 'rooms', name, 'members', state.me.hid), {
     hid: state.me.hid,
     handle: state.me.handle,
@@ -579,19 +725,119 @@ $('#room-form').addEventListener('submit', async (e) => {
     room: name,
     joinedAt: serverTimestamp(),
     lastReadAt: Timestamp.fromMillis(0),
+    invited: true,
   });
   try {
     await batch.commit();
     $('#room-dialog').close();
     openRoom(name);
   } catch (err) {
-    $('#room-error').textContent = err.code === 'permission-denied' ? `Could not create #${name} (maybe it already exists).` : err.message;
+    // A private room someone else made looks the same as a name you may not use.
+    $('#room-error').textContent = err.code === 'permission-denied' ? `#${name} is not available. Pick another name.` : err.message;
+  }
+});
+
+// ---- people in a room (invites) ---------------------------------------------------
+
+const personOf = (hid) => hid.split('~')[0];
+const roomOwner = () => state.rooms.get(state.current)?.createdBy?.split('/')[0] ?? null;
+
+/** Two clicks instead of confirm(): the first arms the button. True on the second click. */
+function armed(btn, label, armedLabel) {
+  if (btn.dataset.armed) return true;
+  btn.dataset.armed = '1';
+  btn.textContent = armedLabel;
+  setTimeout(() => {
+    delete btn.dataset.armed;
+    btn.textContent = label;
+  }, 4000);
+  return false;
+}
+
+function renderPeople() {
+  if (!$('#people-dialog').open) return;
+  $('#people-room').textContent = `#${state.current}`;
+  const owner = roomOwner();
+  const people = new Map(); // person -> their handles in the room
+  for (const p of state.roomInvites) people.set(p, []);
+  for (const m of state.members) people.set(personOf(m.hid), [...(people.get(personOf(m.hid)) ?? []), m.handle]);
+  const list = $('#people-list');
+  list.replaceChildren();
+  for (const [person, handles] of [...people].sort(([a], [b]) => a.localeCompare(b))) {
+    const notes = [person === owner && 'owner', handles.length === 0 && 'invited, not in the room yet'].filter(Boolean).join(' · ');
+    const canRemove = person !== owner && person !== state.me.hid;
+    list.append(
+      el(
+        'li',
+        { class: 'row' },
+        el(
+          'span',
+          {},
+          el('strong', {}, person),
+          handles.length ? el('span', { class: 'muted small' }, ` ${handles.join(', ')}`) : null,
+          notes ? el('div', { class: 'muted small' }, notes) : null,
+        ),
+        canRemove
+          ? el(
+              'button',
+              {
+                class: 'secondary small',
+                title: 'They and their Claude sessions lose access to this room',
+                onclick: async (e) => {
+                  if (!armed(e.currentTarget, 'Remove', 'Click again to remove')) return;
+                  await removePerson(person).catch((err) => toast(permissionMessage(err)));
+                },
+              },
+              'Remove',
+            )
+          : null,
+      ),
+    );
+  }
+}
+
+/** Cancels the invite and removes every member record of that person, in one batch (the rules require both). */
+async function removePerson(person) {
+  const room = state.current;
+  const batch = writeBatch(db);
+  batch.delete(doc(db, 'rooms', room, 'invites', person));
+  for (const m of state.members) if (personOf(m.hid) === person) batch.delete(doc(db, 'rooms', room, 'members', m.hid));
+  await batch.commit();
+  toast(`Removed ${person} from #${room}.`);
+}
+
+$('#open-people').addEventListener('click', () => {
+  $('#invite-form').reset();
+  $('#invite-error').textContent = '';
+  $('#people-dialog').showModal();
+  renderPeople();
+});
+$('#close-people').addEventListener('click', () => $('#people-dialog').close());
+
+$('#invite-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('#invite-error').textContent = '';
+  // Inviting "ana/claude" invites ana: invites are per person.
+  const person = $('#invite-input').value.trim().toLowerCase().replace(/^@/, '').split('/')[0];
+  if (!NAME_RE.test(person)) return ($('#invite-error').textContent = 'Use a handle such as "ana".');
+  if (state.roomInvites.includes(person)) return ($('#invite-error').textContent = `${person} is already invited.`);
+  const handle = await getDoc(doc(db, 'handles', person)).catch(() => null);
+  if (!handle?.exists() || handle.data().kind !== 'human') return ($('#invite-error').textContent = `Nobody is called "${person}" here.`);
+  try {
+    await setDoc(doc(db, 'rooms', state.current, 'invites', person), { hid: person, invitedBy: state.me.handle, invitedAt: serverTimestamp() });
+    $('#invite-form').reset();
+    toast(`Invited ${person} to #${state.current}.`);
+  } catch (err) {
+    // Writing an invite that already exists is an update, which the rules never allow.
+    $('#invite-error').textContent = err?.code === 'permission-denied' ? `Could not invite ${person} (maybe they are already invited).` : permissionMessage(err);
   }
 });
 
 // ---- Claude sessions --------------------------------------------------------------
 
 let agentsUnsub = null;
+let agentDocs = []; // your Claude sessions, as last read
+let agentHids = new Set(); // their handles, watched for presence
 let pairedAgents = []; // sessions currently holding their name
 let suggestAgentName = false;
 
@@ -618,60 +864,59 @@ $('#open-agents').addEventListener('click', () => {
   $('#agents-dialog').showModal();
   agentsUnsub?.();
   agentsUnsub = onSnapshot(query(collection(db, 'agents'), where('owner', '==', state.user.uid)), (snap) => {
-    const list = $('#agent-list');
-    list.replaceChildren();
-    // Replaced sessions (same name paired again) can no longer act, but are listed so their
-    // records can be revoked too.
-    const agents = snap.docs
-      .map((d) => ({ uid: d.id, ...d.data() }))
-      .filter((a) => !a.revoked)
-      .map((a) => ({ ...a, current: state.handles.get(a.hid)?.uid === a.uid }))
-      .sort((a, b) => a.hid.localeCompare(b.hid) || Number(b.current) - Number(a.current));
-    pairedAgents = agents.filter((a) => a.current);
-    if (suggestAgentName) {
-      suggestAgentName = false;
-      $('#agent-name').value = freeAgentName();
-    }
-    for (const a of agents) {
-      const h = state.handles.get(a.hid) ?? {};
-      const detail = a.current ? ` · paired ${timeLabel(a.createdAt)} · ${ago(h.lastSeen)}` : ` · replaced, paired ${timeLabel(a.createdAt)}`;
-      list.append(
-        el(
-          'li',
-          { class: 'row' },
-          el('span', {}, el('strong', {}, hidToHandle(a.hid)), el('span', { class: 'muted small' }, detail)),
-          el(
-            'button',
-            {
-              class: 'secondary small',
-              title: 'That Claude session stops working immediately',
-              // Two clicks instead of confirm(): the first arms the button.
-              onclick: async (e) => {
-                const btn = e.currentTarget;
-                if (!btn.dataset.armed) {
-                  btn.dataset.armed = '1';
-                  btn.textContent = 'Click again to revoke';
-                  setTimeout(() => {
-                    delete btn.dataset.armed;
-                    btn.textContent = 'Revoke';
-                  }, 4000);
-                  return;
-                }
-                await updateDoc(doc(db, 'agents', a.uid), { revoked: true }).catch((err) => toast(permissionMessage(err)));
-              },
-            },
-            'Revoke',
-          ),
-        ),
-      );
-    }
-    if (agents.length === 0) list.append(el('li', { class: 'muted small' }, 'None yet.'));
+    agentDocs = snap.docs.map((d) => ({ uid: d.id, ...d.data() })).filter((a) => !a.revoked);
+    agentHids = new Set(agentDocs.map((a) => a.hid));
+    watchHandles();
+    renderAgents();
   });
 });
+
+function renderAgents() {
+  if (!agentsUnsub) return;
+  const list = $('#agent-list');
+  list.replaceChildren();
+  // Replaced sessions (same name paired again) can no longer act, but are listed so their
+  // records can be revoked too.
+  const agents = agentDocs
+    .map((a) => ({ ...a, current: state.handles.get(a.hid)?.uid === a.uid }))
+    .sort((a, b) => a.hid.localeCompare(b.hid) || Number(b.current) - Number(a.current));
+  pairedAgents = agents.filter((a) => a.current);
+  // Wait until every handle has loaded, so a name in use is not suggested.
+  if (suggestAgentName && agents.every((a) => state.handles.has(a.hid))) {
+    suggestAgentName = false;
+    $('#agent-name').value = freeAgentName();
+  }
+  for (const a of agents) {
+    const h = state.handles.get(a.hid) ?? {};
+    const detail = a.current ? ` · paired ${timeLabel(a.createdAt)} · ${ago(h.lastSeen)}` : ` · replaced, paired ${timeLabel(a.createdAt)}`;
+    list.append(
+      el(
+        'li',
+        { class: 'row' },
+        el('span', {}, el('strong', {}, hidToHandle(a.hid)), el('span', { class: 'muted small' }, detail)),
+        el(
+          'button',
+          {
+            class: 'secondary small',
+            title: 'That Claude session stops working immediately',
+            onclick: async (e) => {
+              if (!armed(e.currentTarget, 'Revoke', 'Click again to revoke')) return;
+              await updateDoc(doc(db, 'agents', a.uid), { revoked: true }).catch((err) => toast(permissionMessage(err)));
+            },
+          },
+          'Revoke',
+        ),
+      ),
+    );
+  }
+  if (agents.length === 0) list.append(el('li', { class: 'muted small' }, 'None yet.'));
+}
 
 $('#agents-dialog').addEventListener('close', () => {
   agentsUnsub?.();
   agentsUnsub = null;
+  agentHids = new Set();
+  watchHandles();
 });
 $('#close-agents').addEventListener('click', () => $('#agents-dialog').close());
 

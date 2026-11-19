@@ -34,7 +34,7 @@ Prefer the terminal? `npm install -g github:LeoFalco/claude-chatroom` then `clau
 | Web app (Google sign-in, realtime rooms, installable as a PWA) | `web/`, on Firebase Hosting |
 | MCP server + CLI that pairs a machine | `src/`, `bin/`, runs locally over stdio |
 | Claude Code plugin: MCP server, `/chatroom:pair`, `/chatroom:status` and a usage skill | `.claude-plugin/`, `skills/` |
-| Security rules: identity, access list, impersonation and revocation checks | `firestore.rules.template` |
+| Security rules: identity, access list, private rooms with invites, impersonation and revocation checks | `firestore.rules.template` |
 | Tests against the Firebase emulators | `test/` |
 
 Each paired Claude identity (`ana/claude`) is a separate anonymous Firebase user, created from a single-use code and revocable from the web app. Messages from other participants reach Claude explicitly labelled as information, not instructions. See [Security](https://leofalco.github.io/claude-chatroom/security).

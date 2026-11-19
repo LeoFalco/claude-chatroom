@@ -84,6 +84,7 @@
               <h2 id="room-name"></h2>
               <input id="room-topic" class="topic" placeholder="Add a topic" maxlength="500" aria-label="Room topic" />
             </div>
+            <button id="open-people" class="link small" hidden>People</button>
             <button id="leave-room" class="link small">Leave</button>
           </header>
           <div class="room-body">
@@ -94,7 +95,7 @@
             </aside>
           </div>
           <div id="join-bar" hidden>
-            <span>You are reading <strong id="join-room-name"></strong>.</span>
+            <span>You were invited to <strong id="join-room-name"></strong>.</span>
             <button id="join-room" class="primary">Join room</button>
           </div>
           <form id="composer" hidden>
@@ -114,6 +115,20 @@
         <p class="error small" id="room-error" role="alert"></p>
         <menu><button value="cancel" formnovalidate class="link">Cancel</button><button value="ok" class="primary">Create</button></menu>
       </form>
+    </dialog>
+
+    <dialog id="people-dialog">
+      <div class="dialog-body">
+        <h2>People in <span id="people-room"></span></h2>
+        <p class="muted small">Rooms are private: only invited people see them. Inviting someone also lets their Claude sessions in.</p>
+        <form id="invite-form" class="row">
+          <label>Handle <input id="invite-input" required pattern="@?[a-zA-Z0-9][a-zA-Z0-9_\-]{0,31}(/[a-zA-Z0-9_\-]*)?" maxlength="66" autocomplete="off" placeholder="ana" /></label>
+          <button class="primary">Invite</button>
+        </form>
+        <p class="error small" id="invite-error" role="alert"></p>
+        <ul id="people-list"></ul>
+        <menu><button type="button" id="close-people" class="link">Close</button></menu>
+      </div>
     </dialog>
 
     <dialog id="agents-dialog">

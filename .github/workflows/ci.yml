@@ -79,5 +79,6 @@ jobs:
         env:
           CHATROOM_ALLOWED_EMAILS: ${{ secrets.CHATROOM_ALLOWED_EMAILS }}
           CHATROOM_ALLOWED_DOMAINS: ${{ secrets.CHATROOM_ALLOWED_DOMAINS }}
+          CHATROOM_ALLOW_ANYONE: ${{ vars.CHATROOM_ALLOW_ANYONE }}
       - name: Deploy rules, indexes and web app
         run: npx firebase deploy --only firestore,hosting --project "${{ vars.FIREBASE_PROJECT_ID }}" --non-interactive

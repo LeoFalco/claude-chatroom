@@ -30,6 +30,10 @@ export function mentionsHandle(mentions, handle) {
 
 export const hidToHandle = (hid) => hid.replace('~', '/');
 export const handleToHid = (handle) => String(handle).toLowerCase().replace(/^@/, '').replace('/', '~');
+/** The person a handle belongs to: "ana/claude" and "ana" are both "ana". */
+export const personOf = (handleOrHid) => String(handleOrHid).split(/[~/]/)[0];
+/** A person given by the user or model: "@ana", "ana/claude" or "ana" all mean "ana". */
+const personArg = (raw) => normalizeName(personOf(String(raw ?? '').trim().replace(/^@/, '')), 'handle');
 
 export function newId(length = 10) {
   const bytes = randomBytes(length);
@@ -195,13 +199,32 @@ export class ChatClient {
 
   async _room(rawName) {
     const name = normalizeName(rawName, 'room name');
-    const doc = await friendly(this.fb.get(`rooms/${name}`), 'Not allowed to read rooms. Was this session revoked?');
-    if (!doc) throw new ChatError(`Room "${name}" does not exist. Use list_rooms to see rooms or create_room to make it.`);
-    return { name, ...doc.data };
+    // Rooms are private: a room you were not invited to looks the same as one that does not exist.
+    const missing = `Room "${name}" does not exist or you were not invited to it. Use list_rooms to see your rooms, create_room to make one, or ask a member to invite your user.`;
+    let doc;
+    try {
+      doc = await this.fb.get(`rooms/${name}`);
+    } catch (err) {
+      if (!isDenied(err)) throw err;
+      // A revoked or replaced session is denied everything: say that, not "not invited".
+      const why = await this.whyDenied().catch(() => null);
+      throw Object.assign(new ChatError(why ?? missing), { denied: true });
+    }
+    if (!doc) throw new ChatError(missing);
+    return { name, ...doc.data, owner: personOf(doc.data.createdBy) };
   }
 
   async _membership(room) {
-    return this.fb.get(`rooms/${room}/members/${this.me.hid}`);
+    try {
+      return await this.fb.get(`rooms/${room}/members/${this.me.hid}`);
+    } catch (err) {
+      if (!isDenied(err)) throw err;
+      // Denied because this session was revoked or replaced: say so.
+      const why = await this.whyDenied().catch(() => null);
+      if (why) throw Object.assign(new ChatError(why), { denied: true });
+      // Otherwise the room is missing or you were not invited: you are not in it.
+      return null;
+    }
   }
 
   async _requireMember(room) {
@@ -219,11 +242,25 @@ export class ChatClient {
     return docs.map((d) => ({ room: d.data.room, lastReadAt: d.data.lastReadAt }));
   }
 
+  /** Rooms your user was invited to: [room name]. */
+  async invitedRooms() {
+    const docs = await friendly(
+      this.fb.query('', {
+        from: [{ collectionId: 'invites', allDescendants: true }],
+        where: q.field('hid', 'EQUAL', this.me.owner),
+      }),
+    );
+    return docs.map((d) => d.path.split('/')[1]);
+  }
+
+  /** Rooms you can see: those your user was invited to plus those you are in. */
   async listRooms() {
-    const [rooms, mine] = await Promise.all([
-      friendly(this.fb.query('', { from: [{ collectionId: 'rooms' }], orderBy: [q.order('__name__')], limit: 200 })),
-      this.memberships(),
-    ]);
+    const [invited, mine] = await Promise.all([this.invitedRooms(), this.memberships()]);
+    const names = [...new Set([...invited, ...mine.map((m) => m.room)])].sort();
+    // One read per room: a room you lost access to (a member record left behind) is skipped
+    // instead of failing the whole list.
+    const docs = await Promise.all(names.map((n) => this.fb.get(`rooms/${n}`).catch((err) => (isDenied(err) ? null : Promise.reject(err)))));
+    const rooms = docs.map((d, i) => (d ? { id: names[i], data: d.data } : null)).filter(Boolean);
     const unread = await this.unread(null, 500);
     const counts = new Map();
     for (const m of unread) counts.set(m.room, (counts.get(m.room) ?? 0) + 1);
@@ -246,23 +283,34 @@ export class ChatClient {
     try {
       await this.fb.commit([
         { path: `rooms/${name}`, mode: 'create', data: { topic: String(topic).slice(0, 500), createdBy: this.me.handle, createdAt: REQUEST_TIME } },
+        this._inviteWrite(name, this.me.owner),
         this._memberWrite(name, Timestamp.epoch()),
       ]);
     } catch (err) {
-      if (err instanceof FirebaseError && (err.status === 409 || err.code === 'ALREADY_EXISTS' || err.code === 'FAILED_PRECONDITION')) {
-        throw new ChatError(`Room "${name}" already exists. Use join_room to enter it.`);
-      }
-      if (err instanceof FirebaseError && err.status === 403) throw new ChatError(`Not allowed to create room "${name}".`);
-      throw err;
+      const exists = err instanceof FirebaseError && (err.status === 409 || ['ALREADY_EXISTS', 'FAILED_PRECONDITION'].includes(err.code));
+      if (!exists && !isDenied(err)) throw err;
+      // A revoked or replaced session is denied everything: say that instead.
+      const why = exists ? null : await this.whyDenied().catch(() => null);
+      if (why) throw Object.assign(new ChatError(why), { denied: true });
+      // A private room someone else made is denied rather than reported as existing.
+      throw Object.assign(
+        new ChatError(`Room name "${name}" is not available (it may already exist). Pick another name, or ask its members to invite your user.`),
+        { denied: true },
+      );
     }
     return { name, topic };
+  }
+
+  _inviteWrite(room, person) {
+    return { path: `rooms/${room}/invites/${person}`, mode: 'create', data: { hid: person, invitedBy: this.me.handle, invitedAt: REQUEST_TIME } };
   }
 
   _memberWrite(room, lastReadAt) {
     return {
       path: `rooms/${room}/members/${this.me.hid}`,
       mode: 'create',
-      data: { hid: this.me.hid, handle: this.me.handle, kind: this.me.kind, room, joinedAt: REQUEST_TIME, lastReadAt },
+      // "invited" marks records made under private rooms; older ones grant access on their own.
+      data: { hid: this.me.hid, handle: this.me.handle, kind: this.me.kind, room, joinedAt: REQUEST_TIME, lastReadAt, invited: true },
     };
   }
 
@@ -276,8 +324,56 @@ export class ChatClient {
       limit: 21,
     });
     const lastReadAt = recent.length === 21 ? recent[20].data.createdAt : Timestamp.epoch();
-    await friendly(this.fb.commit([this._memberWrite(room.name, lastReadAt)]), `Not allowed to join "${room.name}".`);
+    await friendly(this.fb.commit([this._memberWrite(room.name, lastReadAt)]), `Not allowed to join "${room.name}": your user was not invited.`);
     return { room, alreadyMember: false };
+  }
+
+  /** Invites a person (and with them all their Claude sessions) to a room you are in. */
+  async invite(rawName, rawWho) {
+    const room = await this._room(rawName);
+    await this._requireMember(room.name);
+    const person = personArg(rawWho);
+    const handle = await friendly(this.fb.get(`handles/${person}`));
+    if (!handle || handle.data.kind !== 'human') throw new ChatError(`Nobody is called "${person}" here. Invite people by their handle, e.g. "ana".`);
+    try {
+      await this.fb.commit([this._inviteWrite(room.name, person)]);
+    } catch (err) {
+      if (err instanceof FirebaseError && (err.status === 409 || err.code === 'ALREADY_EXISTS')) return { room: room.name, person, alreadyInvited: true };
+      if (isDenied(err)) throw Object.assign(new ChatError(`Not allowed to invite to "${room.name}".`), { denied: true });
+      throw err;
+    }
+    return { room: room.name, person, alreadyInvited: false };
+  }
+
+  /** Removes a person's invite and every member record of theirs (them and their Claude sessions). */
+  async remove(rawName, rawWho) {
+    const room = await this._room(rawName);
+    await this._requireMember(room.name);
+    const person = personArg(rawWho);
+    if (person === room.owner) throw new ChatError(`${person} owns "${room.name}" and cannot be removed.`);
+    // Same as the web UI: you cannot remove yourself; leave instead.
+    if (person === this.me.owner) throw new ChatError(`You cannot remove your own user ${person}. Use leave_room to leave "${room.name}".`);
+    const [invite, members] = await Promise.all([
+      this.fb.get(`rooms/${room.name}/invites/${person}`),
+      this.fb.query(`rooms/${room.name}`, { from: [{ collectionId: 'members' }] }),
+    ]);
+    const theirs = members.filter((m) => personOf(m.id) === person);
+    if (!invite && theirs.length === 0) throw new ChatError(`${person} is not in "${room.name}" and was not invited.`);
+    await friendly(
+      this.fb.commit([
+        { path: `rooms/${room.name}/invites/${person}`, mode: 'delete' },
+        ...theirs.map((m) => ({ path: `rooms/${room.name}/members/${m.id}`, mode: 'delete' })),
+      ]),
+      `Not allowed to remove ${person} from "${room.name}".`,
+    );
+    return { room: room.name, person, removed: theirs.map((m) => m.data.handle) };
+  }
+
+  /** People invited to a room: [person]. */
+  async invites(rawName) {
+    const room = await this._room(rawName);
+    const docs = await friendly(this.fb.query(`rooms/${room.name}`, { from: [{ collectionId: 'invites' }] }));
+    return docs.map((d) => d.id).sort();
   }
 
   async leave(rawName) {
@@ -329,7 +425,10 @@ export class ChatClient {
       mentions: parseMentions(text),
       createdAt: REQUEST_TIME,
     };
-    const [transforms] = await friendly(this.fb.commit([{ path: `rooms/${room}/messages/${id}`, mode: 'create', data }]));
+    const [transforms] = await friendly(
+      this.fb.commit([{ path: `rooms/${room}/messages/${id}`, mode: 'create', data }]),
+      `Not allowed to post in "${room}": your user is no longer invited to it.`,
+    );
     const createdAt = transforms?.[0] ?? null;
     // Keep the read cursor close to the present when nothing from others is pending, so
     // unread queries never have to skip over a long run of our own messages.
@@ -380,12 +479,24 @@ export class ChatClient {
     let since = lastReadAt;
     const pageSize = Math.min(100, Math.max(limit, 20));
     for (let page = 0; page < 20 && out.length < limit; page++) {
-      const docs = await this.fb.query(`rooms/${room}`, {
-        from: [{ collectionId: 'messages' }],
-        where: q.field('createdAt', 'GREATER_THAN', since),
-        orderBy: [q.order('createdAt')],
-        limit: pageSize,
-      });
+      let docs;
+      try {
+        docs = await this.fb.query(`rooms/${room}`, {
+          from: [{ collectionId: 'messages' }],
+          where: q.field('createdAt', 'GREATER_THAN', since),
+          orderBy: [q.order('createdAt')],
+          limit: pageSize,
+        });
+      } catch (err) {
+        // Removed from this room (only a stale member record is left): drop the record, so
+        // polling stops paying for it, and read nothing there. A revoked or replaced session
+        // still fails, with its reason.
+        if (isDenied(err) && !(await this.whyDenied().catch(() => null))) {
+          await this.leave(room).catch(() => {});
+          return [];
+        }
+        throw err;
+      }
       for (const d of docs) {
         const m = toMessage(d);
         if (m.author !== this.me.handle) out.push(m);

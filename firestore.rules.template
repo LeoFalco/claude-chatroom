@@ -81,6 +81,47 @@ service cloud.firestore {
       return exists(/databases/$(database)/documents/rooms/$(room)/members/$(myHid()));
     }
 
+    // The person behind the caller: a human's own handle, or the owner of a Claude session.
+    function myPerson() {
+      return provider() == 'anonymous' ? agent().ownerHid : myHid();
+    }
+
+    // The person a handle id belongs to: "ana~claude" -> "ana".
+    function personOf(hid) {
+      return hid.split('~')[0];
+    }
+
+    // Rooms are private. The person who created a room owns it; nobody can remove them.
+    function roomOwner(room) {
+      return doc(/databases/$(database)/documents/rooms/$(room)).createdBy.split('/')[0];
+    }
+
+    function isInvited(room) {
+      return exists(/databases/$(database)/documents/rooms/$(room)/invites/$(myPerson()));
+    }
+
+    // Member records written before rooms became private (they lack the "invited" field) still
+    // grant access without an invite. Newer ones only count while their person is invited, so a
+    // record left behind after a removal grants nothing.
+    function isLegacyMember(room) {
+      return isMember(room)
+        && !('invited' in get(/databases/$(database)/documents/rooms/$(room)/members/$(myHid())).data);
+    }
+
+    // Invited people (and their Claude sessions) may see a room.
+    function hasAccess(room) {
+      return isInvited(room) || isLegacyMember(room);
+    }
+
+    function canAccess(room) {
+      return isActor() && hasAccess(room);
+    }
+
+    // In the room and still allowed there: needed to post, invite, remove or change the topic.
+    function isActiveMember(room) {
+      return isMember(room) && hasAccess(room);
+    }
+
     // ---- humans ------------------------------------------------------------
 
     match /users/{uid} {
@@ -97,7 +138,8 @@ service cloud.firestore {
     }
 
     match /handles/{hid} {
-      allow read: if isActor();
+      // One handle at a time: nobody can list everyone who signed up.
+      allow get: if isActor();
       // Lets an allowed newcomer find out whether the handle they want is taken.
       allow get: if isAllowedGoogleUser();
       // Lets a Claude session read its own handle even after it was replaced, so it can tell
@@ -211,30 +253,58 @@ service cloud.firestore {
     // ---- rooms ---------------------------------------------------------------
 
     match /rooms/{room} {
-      allow read: if isActor();
+      // Rooms are private: no listing; each room is read on its own by those invited.
+      allow get: if canAccess(room);
+      // The creator invites themselves in the same batch (see invites below).
       allow create: if isActor()
         && isName(room)
         && request.resource.data.keys().hasOnly(['topic', 'createdBy', 'createdAt'])
         && request.resource.data.topic is string
         && request.resource.data.topic.size() <= 500
         && request.resource.data.createdBy == displayHandle(myHid())
-        && request.resource.data.createdAt == request.time;
+        && request.resource.data.createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/rooms/$(room)/invites/$(myPerson()));
       allow update: if isActor()
-        && isMember(room)
+        && isActiveMember(room)
         && onlyChanges(['topic'])
         && request.resource.data.topic is string
         && request.resource.data.topic.size() <= 500;
 
+      // invites/{person}: that person and all their Claude sessions may see and join the room.
+      match /invites/{person} {
+        allow read: if canAccess(room);
+        allow create: if isActor()
+          && isName(person)
+          && request.resource.data.keys().hasOnly(['hid', 'invitedBy', 'invitedAt'])
+          && request.resource.data.hid == person
+          && request.resource.data.invitedBy == displayHandle(myHid())
+          && request.resource.data.invitedAt == request.time
+          && (
+            // Only real people are invited (their Claude sessions come along).
+            (exists(/databases/$(database)/documents/handles/$(person))
+              && doc(/databases/$(database)/documents/handles/$(person)).kind == 'human'
+              && isActiveMember(room))
+            // The creator of a new room invites themselves.
+            || (!exists(/databases/$(database)/documents/rooms/$(room))
+              && person == myPerson()
+              && getAfter(/databases/$(database)/documents/rooms/$(room)).data.createdBy == displayHandle(myHid()))
+          );
+        // Any member removes anyone but the owner (their member records go in the same batch).
+        allow delete: if isActor() && isActiveMember(room) && person != roomOwner(room);
+      }
+
       match /members/{hid} {
-        allow read: if isActor();
+        allow read: if canAccess(room);
         allow create: if isActor()
           && hid == myHid()
           && existsAfter(/databases/$(database)/documents/rooms/$(room))
-          && request.resource.data.keys().hasOnly(['hid', 'handle', 'kind', 'room', 'joinedAt', 'lastReadAt'])
+          && existsAfter(/databases/$(database)/documents/rooms/$(room)/invites/$(myPerson()))
+          && request.resource.data.keys().hasOnly(['hid', 'handle', 'kind', 'room', 'joinedAt', 'lastReadAt', 'invited'])
           && request.resource.data.hid == hid
           && request.resource.data.handle == displayHandle(hid)
           && request.resource.data.kind == myKind()
           && request.resource.data.room == room
+          && request.resource.data.invited == true
           && request.resource.data.joinedAt == request.time
           && request.resource.data.lastReadAt is timestamp
           && request.resource.data.lastReadAt <= request.time;
@@ -243,14 +313,20 @@ service cloud.firestore {
           && onlyChanges(['lastReadAt'])
           && request.resource.data.lastReadAt is timestamp
           && request.resource.data.lastReadAt <= request.time;
-        allow delete: if isActor() && hid == myHid();
+        // Leaving, or removing someone else (never the owner) whose invite goes in the same batch.
+        allow delete: if isActor() && (
+          hid == myHid()
+          || (isActiveMember(room)
+            && personOf(hid) != roomOwner(room)
+            && !existsAfter(/databases/$(database)/documents/rooms/$(room)/invites/$(personOf(hid))))
+        );
       }
 
       match /messages/{id} {
-        allow read: if isActor();
+        allow read: if canAccess(room);
         // Messages are immutable once written.
         allow create: if isActor()
-          && isMember(room)
+          && isActiveMember(room)
           && id.matches('^[a-z0-9]{8,32}$')
           && request.resource.data.keys().hasOnly(['room', 'author', 'authorHid', 'authorKind', 'authorUid', 'text', 'replyTo', 'mentions', 'createdAt'])
           && request.resource.data.room == room
@@ -269,9 +345,13 @@ service cloud.firestore {
       }
     }
 
-    // Collection-group query: "which rooms am I in".
+    // Collection-group queries: "which rooms am I in" and "which rooms was I invited to".
     match /{path=**}/members/{hid} {
-      allow read: if isActor();
+      allow read: if isActor() && resource.data.hid == myHid();
+    }
+
+    match /{path=**}/invites/{person} {
+      allow read: if isActor() && resource.data.hid == myPerson();
     }
   }
 }

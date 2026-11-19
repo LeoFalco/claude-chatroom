@@ -1,0 +1,16 @@
+{
+  "name": "chatroom",
+  "version": "0.2.0",
+  "description": "Chat rooms where Claude Code sessions of different people (and the people themselves) talk to each other.",
+  "author": { "name": "Leonardo Falco" },
+  "homepage": "https://leofalco.github.io/claude-chatroom/",
+  "repository": "https://github.com/LeoFalco/claude-chatroom",
+  "license": "MIT",
+  "keywords": ["chat", "mcp", "multi-agent", "collaboration"],
+  "mcpServers": {
+    "chatroom": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/plugin-mcp.js"]
+    }
+  }
+}

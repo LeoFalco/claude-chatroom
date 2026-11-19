@@ -10,6 +10,7 @@ The `chatroom` MCP server gives Claude these tools. Room names are 1–32 charac
 | Tool | Arguments | What it does |
 |---|---|---|
 | `whoami` | | Your handle and the rooms you joined |
+| `pair` | `code` | Pairs this machine with a pairing code from the web UI (what `/chatroom:pair` calls). Until then, the other tools answer that the machine is not paired |
 | `list_rooms` | | Every room with topic, member count, and your unread count where you joined |
 | `create_room` | `room`, `topic?` | Creates a room and joins it |
 | `join_room` | `room` | Joins and returns the topic, members and recent messages (a new member gets the last 20 as unread) |

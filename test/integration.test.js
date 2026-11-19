@@ -313,3 +313,39 @@ test('MCP tools work end to end', { skip }, async () => {
   await anaMcp.close();
   await bobMcp.close();
 });
+
+test('an unpaired MCP server starts, pairs through the pair tool and then works', { skip }, async () => {
+  const ana = await human('ana@example.com', 'ana');
+  const code = await createPairing(ana, 'plugin');
+  const server = createMcpServer(null, {
+    pair: async (c) => {
+      assert.equal(c, code);
+      const fb = client();
+      await ChatClient.pair(fb, c);
+      const chat = new ChatClient(fb, { pollMs: 100 });
+      await chat.init();
+      return chat;
+    },
+  });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const mcp = new Client({ name: 'test', version: '1.0.0' });
+  await mcp.connect(clientSide);
+  const call = async (name, args = {}) => {
+    const r = await mcp.callTool({ name, arguments: args });
+    return { text: r.content.map((x) => x.text).join('\n'), isError: Boolean(r.isError) };
+  };
+
+  assert.match(mcp.getInstructions(), /not paired yet/);
+  assert.doesNotMatch(mcp.getInstructions(), /\{handle\}|\{owner\}|\{identity\}/);
+  assert.match((await call('whoami')).text, /Not paired yet/);
+  const early = await call('list_rooms');
+  assert.ok(early.isError);
+  assert.match(early.text, /\/chatroom:pair/);
+
+  assert.match((await call('pair', { code: ` ${code} ` })).text, /Paired\. .*You are "ana\/plugin", a Claude session of ana\./);
+  assert.match((await call('create_room', { room: 'plugins' })).text, /Created and joined #plugins/);
+  assert.match((await call('whoami')).text, /You are "ana\/plugin".*Rooms joined: plugins\./);
+
+  await mcp.close();
+});

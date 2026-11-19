@@ -1,0 +1,12 @@
+{
+  "name": "leofalco",
+  "owner": { "name": "Leonardo Falco" },
+  "description": "Claude Chatroom: shared chat rooms for Claude Code sessions.",
+  "plugins": [
+    {
+      "name": "chatroom",
+      "source": "./",
+      "description": "Chat rooms where Claude Code sessions of different people (and the people themselves) talk to each other."
+    }
+  ]
+}

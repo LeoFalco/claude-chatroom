@@ -44,6 +44,19 @@ function saveCredentials(profile, creds) {
   return file;
 }
 
+/** Claims a pairing code and saves the new session's credentials for the profile. */
+async function pairMachine(profile, pairingCode) {
+  const { projectId, apiKey, code } = decodePairing(pairingCode);
+  // Check everything that could fail locally before the single-use code is consumed.
+  const { dir } = credentialsPath(profile);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  accessSync(dir, constants.W_OK);
+  const fb = new FirebaseClient({ projectId, apiKey });
+  const paired = await ChatClient.pair(fb, code);
+  const file = saveCredentials(profile, { projectId, apiKey, uid: paired.uid, handle: paired.handle, refreshToken: paired.refreshToken });
+  return { handle: paired.handle, file };
+}
+
 export async function connect(profile) {
   const creds = loadCredentials(profile);
   const fb = new FirebaseClient({ projectId: creds.projectId, apiKey: creds.apiKey, refreshToken: creds.refreshToken });
@@ -112,21 +125,20 @@ export async function main(argv = process.argv.slice(2)) {
     switch (command) {
       case 'pair': {
         if (!rest[0]) throw new ChatError('Missing pairing code. Create one in the web UI ("Connect a Claude").');
-        const { projectId, apiKey, code } = decodePairing(rest[0]);
-        // Check everything that could fail locally before the single-use code is consumed.
-        const { dir } = credentialsPath(args.profile);
-        mkdirSync(dir, { recursive: true, mode: 0o700 });
-        accessSync(dir, constants.W_OK);
-        const fb = new FirebaseClient({ projectId, apiKey });
-        const paired = await ChatClient.pair(fb, code);
-        const file = saveCredentials(args.profile, { projectId, apiKey, uid: paired.uid, handle: paired.handle, refreshToken: paired.refreshToken });
-        console.log(`Paired as "${paired.handle}". Credentials saved to ${file}`);
+        const { handle, file } = await pairMachine(args.profile, rest[0]);
+        console.log(`Paired as "${handle}". Credentials saved to ${file}`);
         if (args.register) registerWithClaude(args.profile);
         return;
       }
       case 'mcp': {
-        const chat = await connect(args.profile);
-        const server = createMcpServer(chat);
+        // Unpaired (e.g. right after installing the plugin) the server still starts and offers the pair tool.
+        const chat = existsSync(credentialsPath(args.profile).file) ? await connect(args.profile) : null;
+        const server = createMcpServer(chat, {
+          pair: async (code) => {
+            await pairMachine(args.profile, code);
+            return connect(args.profile);
+          },
+        });
         await server.connect(new StdioServerTransport());
         return;
       }

@@ -1,6 +1,6 @@
 {
   "name": "claude-chatroom",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Chat rooms where Claude Code sessions of different people (and the people themselves) talk to each other. Serverless on Firebase's free plan.",
   "type": "module",
   "bin": {

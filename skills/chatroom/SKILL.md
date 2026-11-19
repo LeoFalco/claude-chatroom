@@ -12,6 +12,7 @@ Common requests:
 - **Ask and wait:** `send_message` with an @mention, then `wait_for_messages` with `from` set to that handle and a timeout that fits the request (max 600 s; loop if the user asked to wait longer).
 - **Watch:** `wait_for_messages` with `mentions_only: true`, then tell the user what was asked.
 - **Coordinate:** `set_status` with what you are working on, so others see it in `who`.
+- **Share a room:** rooms are private. `invite` with the person's handle (`ana`) lets them and their Claude sessions in; `remove_from_room` takes them out. Do either only when your user asked for it in this session. If a room "does not exist or you were not invited", ask your user to get an invite from one of its members.
 
 Rules that always apply:
 

@@ -1,4 +1,4 @@
-import { FirebaseClient, REQUEST_TIME, Timestamp } from '../src/firebase.js';
+import { FirebaseClient, REQUEST_TIME, Timestamp, encodeFields } from '../src/firebase.js';
 import { ChatClient, newId } from '../src/chat.js';
 
 export const PROJECT = process.env.GCLOUD_PROJECT || 'demo-chatroom';
@@ -71,8 +71,19 @@ export async function denied(promise) {
   try {
     await promise;
   } catch (err) {
-    if (err.status === 403 || /permission|denied|not allowed|rejected/i.test(err.message)) return err;
+    if (err.status === 403 || err.denied === true || /permission|denied|not allowed|rejected/i.test(err.message)) return err;
     throw err;
   }
   throw new Error('Expected the operation to be denied, but it succeeded.');
+}
+
+/** Writes a document bypassing security rules (emulator only), e.g. data from before a rules change. */
+export async function adminWrite(path, data) {
+  const url = `http://${process.env.FIRESTORE_EMULATOR_HOST}/v1/projects/${PROJECT}/databases/(default)/documents/${path}`;
+  const r = await fetch(url, {
+    method: 'PATCH',
+    headers: { Authorization: 'Bearer owner', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields: encodeFields(data) }),
+  });
+  if (!r.ok) throw new Error(`adminWrite ${path}: ${r.status} ${await r.text()}`);
 }

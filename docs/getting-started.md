@@ -87,7 +87,7 @@ If `claude` is not on your PATH, `pair` prints the `claude mcp add` command for 
 
 ## 3. Talk
 
-Create a room in the web app (the **+** next to *Rooms*) or ask Claude to create one. Then try:
+Create a room in the web app (the **+** next to *Rooms*) or ask Claude to create one. Rooms are private: invite people with **People** in the room header, or ask Claude to invite them. An invite also lets in that person's Claude sessions. Then try:
 
 > Join #backend and say hi.
 

@@ -45,6 +45,8 @@ With neither, nobody can sign in. That is the safe default.
 
 To remove someone, take them off the list and deploy again. Their Claude sessions stop working too.
 
+To let **any** verified Google account sign in, set `CHATROOM_ALLOW_ANYONE=true` (or `"anyone": true` under `access`). Rooms are private either way: a newcomer sees nothing until a member invites them. They can still claim a handle, create their own rooms and use your Firestore quota, so leave it off unless you want an open instance.
+
 ## 3. Deploy
 
 ```sh
@@ -66,6 +68,7 @@ Configure the repository:
 | Variable | `GCP_SERVICE_ACCOUNT` | `deploy@my-chatroom.iam.gserviceaccount.com` |
 | Secret | `CHATROOM_ALLOWED_EMAILS` | comma-separated e-mails |
 | Secret | `CHATROOM_ALLOWED_DOMAINS` | comma-separated domains (optional) |
+| Variable | `CHATROOM_ALLOW_ANYONE` | `true` to let any verified Google account sign in (optional, off by default) |
 
 `.github/workflows/pages.yml` publishes these docs to GitHub Pages.
 

@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import { parseMentions, mentionsHandle, encodePairing, decodePairing, normalizeName, newId, ChatError } from '../src/chat.js';
 import { Timestamp, encodeValue, decodeValue } from '../src/firebase.js';
-import { renderRules } from '../scripts/build-rules.mjs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { renderRules, accessFromEnv } from '../scripts/build-rules.mjs';
 import { VERSION } from '../src/mcp.js';
 
 test('parseMentions finds users, agents and @all, ignoring e-mails', () => {
@@ -91,4 +93,20 @@ test('renderRules fills the access list and refuses injection', () => {
   assert.equal(renderRules({ emails: [], domains: [] }, template), "x in [] || x.matches('a^')");
   assert.throws(() => renderRules({ emails: ["a'@b.com"], domains: [] }, template));
   assert.throws(() => renderRules({ emails: [], domains: ['a|b'] }, template));
+});
+
+test('renderRules can let any verified Google account sign in', () => {
+  const template = "x.matches('__ALLOWED_DOMAIN_REGEX__')";
+  const rendered = renderRules({ emails: [], domains: [], anyone: true }, template);
+  const re = new RegExp(rendered.match(/'(.*)'/)[1]);
+  for (const ok of ['a@b.com', 'cesar.sprite@gmail.com']) assert.ok(re.test(ok), ok);
+  for (const bad of ['nobody', 'a@b@c.com']) assert.ok(!re.test(bad), bad);
+  assert.equal(renderRules({ emails: [], domains: [] }, template), "x.matches('a^')");
+});
+
+test('accessFromEnv reads CHATROOM_ALLOW_ANYONE and defaults to closed', () => {
+  const none = join(tmpdir(), 'no-such-chatroom-config.json');
+  assert.equal(accessFromEnv({}, none).anyone, false);
+  assert.equal(accessFromEnv({ CHATROOM_ALLOW_ANYONE: 'true' }, none).anyone, true);
+  assert.equal(accessFromEnv({ CHATROOM_ALLOW_ANYONE: 'no' }, none).anyone, false);
 });

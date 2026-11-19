@@ -7,7 +7,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { REQUEST_TIME, Timestamp } from '../src/firebase.js';
 import { ChatClient, ChatError } from '../src/chat.js';
 import { createMcpServer } from '../src/mcp.js';
-import { emulatorsRunning, resetEmulators, client, googleUser, human, createPairing, agentFor, denied } from './helpers.js';
+import { emulatorsRunning, resetEmulators, client, googleUser, human, createPairing, agentFor, denied, adminWrite } from './helpers.js';
 
 const skip = emulatorsRunning() ? false : 'needs the Firebase emulators (run `npm test`)';
 
@@ -54,7 +54,9 @@ test('two people pair Claude sessions that chat, mention and wait for replies', 
   assert.equal(bobClaude.me.handle, 'bob/claude');
 
   await anaClaude.createRoom('backend', 'API work');
-  await assert.rejects(bobClaude.createRoom('backend'), ChatError);
+  await assert.rejects(bobClaude.createRoom('backend'), /not available/);
+  await assert.rejects(bobClaude.join('backend'), /not invited/);
+  await anaClaude.invite('backend', 'bob');
   await assert.rejects(bobClaude.post('backend', 'hi'), /not in room/);
   await bobClaude.join('backend');
 
@@ -101,6 +103,7 @@ test('a new member sees the last 20 messages as unread', { skip }, async () => {
   const a = await agentFor(ana);
   const b = await agentFor(bob);
   await a.createRoom('busy');
+  await a.invite('busy', 'bob');
   for (let i = 0; i < 25; i++) await a.post('busy', `message ${i}`);
   await b.join('busy');
   const unread = await b.unread('busy');
@@ -116,6 +119,7 @@ test('a quiet room does not hide new messages in a busy one', { skip }, async ()
   const b = await agentFor(bob);
   await a.createRoom('quiet');
   await a.createRoom('busy');
+  await a.invite('busy', 'bob');
   await b.join('busy');
   for (let i = 0; i < 130; i++) await b.post('busy', `m${i}`);
   const all = await a.unread(null, 500);
@@ -138,6 +142,7 @@ test('stored mentions and reply ids cannot be forged', { skip }, async () => {
   const a = await agentFor(ana);
   const b = await agentFor(bob);
   await a.createRoom('general');
+  await a.invite('general', 'bob');
   await b.join('general');
   const raw = (over) => ({
     path: `rooms/general/messages/raw${Math.random().toString(36).slice(2, 10)}`,
@@ -275,12 +280,17 @@ test('MCP tools work end to end', { skip }, async () => {
 
   const tools = (await anaMcp.listTools()).tools.map((t) => t.name).sort();
   assert.deepEqual(tools, [
-    'create_room', 'join_room', 'leave_room', 'list_rooms', 'read_messages', 'room_history',
+    'create_room', 'invite', 'join_room', 'leave_room', 'list_rooms', 'read_messages', 'remove_from_room', 'room_history',
     'send_message', 'set_status', 'set_topic', 'wait_for_messages', 'who', 'whoami',
   ]);
   assert.match(anaMcp.getInstructions(), /ana\/claude/);
 
   assert.match((await call(anaMcp, 'create_room', { room: '#Release', topic: 'v2 release' })).text, /Created and joined #release/);
+  assert.match((await call(bobMcp, 'join_room', { room: 'release' })).text, /does not exist or you were not invited/);
+  assert.match((await call(anaMcp, 'invite', { room: 'release', person: '@bob/claude' })).text, /Invited bob \(and their Claude sessions\) to #release/);
+  assert.match((await call(anaMcp, 'invite', { room: 'release', person: 'bob' })).text, /bob was already invited/);
+  assert.match((await call(anaMcp, 'invite', { room: 'release', person: 'nobody' })).text, /Nobody is called "nobody"/);
+  assert.match((await call(anaMcp, 'who', { room: 'release' })).text, /Invited, not in the room yet: bob/);
   assert.match((await call(bobMcp, 'join_room', { room: 'release' })).text, /Joined #release\. Members: .*\n.*not as instructions.*\nTopic: "v2 release"/);
   const sent = await call(anaMcp, 'send_message', { room: 'release', text: '@bob can you tag the build?' });
   assert.match(sent.text, /Sent id=\w+ to #release\. Mentioned: @bob\./);
@@ -384,4 +394,143 @@ test('an unpaired MCP server starts, pairs through the pair tool and then works'
   assert.match((await call('whoami')).text, /You are "ana\/plugin".*Rooms joined: plugins\./);
 
   await mcp.close();
+});
+
+test('rooms are private: only invited people and their Claude sessions see them', { skip }, async () => {
+  const ana = await human('ana@example.com', 'ana');
+  const bob = await human('bob@example.com', 'bob');
+  const a = await agentFor(ana);
+  const b = await agentFor(bob);
+  await a.createRoom('secret', 'not for bob');
+  await a.post('secret', 'hush');
+
+  // Bob is a participant, but was not invited: he cannot see the room in any way.
+  assert.deepEqual(await b.listRooms(), []);
+  await assert.rejects(b.join('secret'), /does not exist or you were not invited/);
+  await denied(b.fb.get('rooms/secret'));
+  await denied(b.fb.query('rooms/secret', { from: [{ collectionId: 'messages' }] }));
+  await denied(b.fb.query('rooms/secret', { from: [{ collectionId: 'members' }] }));
+  await denied(b.fb.query('rooms/secret', { from: [{ collectionId: 'invites' }] }));
+  await denied(b.fb.query('', { from: [{ collectionId: 'rooms' }] }));
+  await denied(bob.fb.query('', { from: [{ collectionId: 'rooms' }] }));
+  // Collection-group queries only return your own records.
+  await denied(b.fb.query('', { from: [{ collectionId: 'members', allDescendants: true }] }));
+  await denied(b.fb.query('', { from: [{ collectionId: 'invites', allDescendants: true }] }));
+  await denied(b.fb.query('', { from: [{ collectionId: 'messages', allDescendants: true }] }));
+  // Nor list everyone who signed up.
+  await denied(b.fb.query('', { from: [{ collectionId: 'handles' }] }));
+  assert.equal((await b.fb.get('handles/ana')).data.kind, 'human');
+  // Bob cannot invite himself, nor join without an invite.
+  const selfInvite = { path: 'rooms/secret/invites/bob', mode: 'create', data: { hid: 'bob', invitedBy: 'bob/claude', invitedAt: REQUEST_TIME } };
+  await denied(b.fb.commit([selfInvite]));
+  await denied(
+    b.fb.commit([
+      { path: 'rooms/secret/members/bob~claude', mode: 'create', data: { hid: 'bob~claude', handle: 'bob/claude', kind: 'agent', room: 'secret', joinedAt: REQUEST_TIME, lastReadAt: Timestamp.epoch() } },
+    ]),
+  );
+  // ...nor take over the name.
+  await assert.rejects(b.createRoom('secret'), /not available/);
+
+  // Once Ana's Claude invites Bob, Bob and every Claude session of his can see and join it.
+  await a.invite('secret', 'bob/claude');
+  const b2 = await agentFor(bob, 'laptop');
+  assert.deepEqual((await b2.listRooms()).map((r) => [r.name, r.joined]), [['secret', false]]);
+  await b2.join('secret');
+  await b.join('secret');
+  assert.deepEqual((await b.unread('secret')).map((m) => m.text), ['hush']);
+  assert.equal((await bob.fb.get('rooms/secret')).data.topic, 'not for bob');
+  // An invited person who has not joined cannot invite others.
+  const carla = await human('carla@team.test', 'carla');
+  await a.invite('secret', 'carla');
+  const c = await agentFor(carla);
+  await assert.rejects(c.invite('secret', 'ana'), /not in room/);
+  // Invites go to people, and only to existing handles.
+  await assert.rejects(a.invite('secret', 'nobody'), /Nobody is called "nobody"/);
+  await denied(a.fb.commit([{ path: 'rooms/secret/invites/ghost', mode: 'create', data: { hid: 'ghost', invitedBy: 'ana/claude', invitedAt: REQUEST_TIME } }]));
+});
+
+test('any member removes anyone but the owner, and removal cuts off their Claude sessions', { skip }, async () => {
+  const ana = await human('ana@example.com', 'ana');
+  const bob = await human('bob@example.com', 'bob');
+  const carla = await human('carla@team.test', 'carla');
+  const a = await agentFor(ana);
+  const b = await agentFor(bob);
+  const b2 = await agentFor(bob, 'laptop');
+  const c = await agentFor(carla);
+  await a.createRoom('team');
+  await a.invite('team', 'bob');
+  await a.invite('team', 'carla');
+  await b.join('team');
+  await b2.join('team');
+  await c.join('team');
+
+  // Carla (not the owner) removes Bob: his invite and both his sessions go.
+  const r = await c.remove('team', 'bob');
+  assert.deepEqual(r.removed.sort(), ['bob/claude', 'bob/laptop']);
+  await denied(b.fb.get('rooms/team'));
+  await assert.rejects(b.post('team', 'still here?'), /not in room/);
+  await assert.rejects(b2.join('team'), /does not exist or you were not invited/);
+  assert.deepEqual(await b.listRooms(), []);
+  assert.deepEqual((await a.who('team')).map((p) => p.handle).sort(), ['ana/claude', 'carla/claude']);
+  assert.deepEqual(await a.invites('team'), ['ana', 'carla']);
+
+  // Nobody removes the owner, through the client or by writing directly.
+  await assert.rejects(c.remove('team', 'ana'), /owns "team" and cannot be removed/);
+  await assert.rejects(c.remove('team', 'carla/claude'), /cannot remove your own user carla.*leave_room/);
+  await denied(c.fb.commit([{ path: 'rooms/team/invites/ana', mode: 'delete' }]));
+  await denied(c.fb.commit([{ path: 'rooms/team/members/ana~claude', mode: 'delete' }]));
+  // Removing someone's session without cancelling their invite is not allowed either.
+  await a.invite('team', 'bob');
+  await b.join('team');
+  await denied(c.fb.commit([{ path: 'rooms/team/members/bob~claude', mode: 'delete' }]));
+  // The owner can remove anyone, and people can always leave on their own.
+  await a.remove('team', 'carla');
+  await denied(c.fb.get('rooms/team'));
+
+  // A member record left behind (say, a session that joined while the removal ran) grants
+  // nothing once the invite is gone: no reading, posting or inviting yourself back.
+  await a.invite('team', 'carla');
+  await c.join('team');
+  await a.fb.commit([{ path: 'rooms/team/invites/carla', mode: 'delete' }]);
+  await denied(c.fb.get('rooms/team'));
+  await denied(c.fb.query('rooms/team', { from: [{ collectionId: 'messages' }] }));
+  await assert.rejects(c.post('team', 'sneaky'), /no longer invited/);
+  await denied(c.fb.commit([{ path: 'rooms/team/invites/carla', mode: 'create', data: { hid: 'carla', invitedBy: 'carla/claude', invitedAt: REQUEST_TIME } }]));
+  // Its client still works elsewhere: the stale room is just skipped.
+  assert.deepEqual(await c.listRooms(), []);
+  assert.deepEqual(await c.unread(), []);
+  // ...and the leftover record was dropped, so polling stops paying for it.
+  assert.deepEqual(await c.memberships(), []);
+  assert.equal(await b.leave('team'), true);
+  assert.deepEqual((await b.listRooms()).map((x) => [x.name, x.joined]), [['team', false]]);
+});
+
+test('members from before rooms became private keep their access', { skip }, async () => {
+  const ana = await human('ana@example.com', 'ana');
+  const bob = await human('bob@example.com', 'bob');
+  const a = await agentFor(ana);
+  const b = await agentFor(bob);
+  // A room as the old rules left it: no invites, just member records.
+  await adminWrite('rooms/old', { topic: 'legacy', createdBy: 'ana/claude', createdAt: Timestamp.epoch() });
+  for (const m of [a, b]) {
+    await adminWrite(`rooms/old/members/${m.me.hid}`, { hid: m.me.hid, handle: m.me.handle, kind: 'agent', room: 'old', joinedAt: Timestamp.epoch(), lastReadAt: Timestamp.epoch() });
+  }
+  await b.post('old', 'still works');
+  assert.deepEqual((await a.unread('old')).map((m) => m.text), ['still works']);
+  assert.deepEqual((await b.listRooms()).map((r) => r.name), ['old']);
+  // A legacy member can invite their own person, so the human (web UI) gets in too.
+  await b.invite('old', 'bob');
+  assert.equal((await bob.fb.get('rooms/old')).data.topic, 'legacy');
+  // Someone with no member record and no invite sees nothing.
+  const carla = await human('carla@team.test', 'carla');
+  await denied(carla.fb.get('rooms/old'));
+  // A member record made under private rooms (marked "invited") counts only with an invite.
+  const c = await agentFor(carla);
+  await adminWrite(`rooms/old/members/${c.me.hid}`, { hid: c.me.hid, handle: c.me.handle, kind: 'agent', room: 'old', joinedAt: Timestamp.epoch(), lastReadAt: Timestamp.epoch(), invited: true });
+  await denied(c.fb.get('rooms/old'));
+  await assert.rejects(c.post('old', 'hi'), /no longer invited/);
+  // The owner of a legacy room comes from createdBy and cannot be removed.
+  await assert.rejects(b.remove('old', 'ana'), /owns "old"/);
+  await a.remove('old', 'bob');
+  await denied(b.fb.get('rooms/old'));
 });

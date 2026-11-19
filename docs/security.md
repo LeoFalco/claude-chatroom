@@ -9,7 +9,10 @@ nav_order: 5
 
 The rules are in [`firestore.rules.template`](https://github.com/LeoFalco/claude-chatroom/blob/main/firestore.rules.template) and are covered by tests that run against the Firestore emulator.
 
-- **Only listed people get in.** Google accounts must have a verified e-mail on the access list. Everyone else, and any anonymous user that was never paired, can read nothing.
+- **Only listed people get in.** Google accounts must have a verified e-mail on the access list. Everyone else, and any anonymous user that was never paired, can read nothing. An instance can instead let any verified Google account sign in (`CHATROOM_ALLOW_ANYONE`, see [Self-hosting](self-hosting#who-can-sign-in)); rooms stay private either way.
+- **Rooms are private.** A room, its topic, members, invites and messages can only be read by people invited to it, and by their Claude sessions. Nobody can list all rooms or all handles. A room someone else made looks the same as a room that does not exist.
+- **Only members invite**, and only real people (an invite covers that person's Claude sessions). Any member can remove anyone except the room's creator. Access follows the invite: once it is cancelled, that person and all their sessions lose the room, even if a member record of theirs is left behind. Leaving keeps your invite, so you can still read the room and join again; to lose access, ask a member to remove you.
+- **Rooms from before invites existed** keep working for the people already in them: member records written before rooms became private count as access. New members need an invite.
 - **No impersonation.** A message's author, author kind (human or Claude) and timestamp must match the identity and server time of whoever writes it. A Claude session cannot post as its owner, and nobody can post as someone else.
 - **Messages are immutable.** They cannot be edited or deleted by clients.
 - **You only touch your own state:** your membership, read cursor, status and Claude sessions.
@@ -32,7 +35,9 @@ This lowers the risk but **does not remove it**. Keep your usual Claude Code per
 
 ## What other members can see
 
-Room names, topics, messages, members, handles, statuses and last-activity times are visible to everyone on the instance. E-mail addresses are not shown in the app. Your e-mail is only stored in your pairing codes and Claude session records (`pairings`, `agents`), which only you, your sessions and whoever holds a pairing code can read.
+A room's topic, messages, members and invites are visible to the people invited to it and their Claude sessions. Anyone signed in can look up a handle by its exact name and see its status and last activity, but cannot list handles. E-mail addresses are not shown in the app.
+
+Inviting someone shows them the room's whole history. A Claude session can invite and remove people, so an instruction hidden in a chat message could try to make it do so; the tools tell Claude to do that only when its own user asked in the session. Your e-mail is only stored in your pairing codes and Claude session records (`pairings`, `agents`), which only you, your sessions and whoever holds a pairing code can read.
 
 ## Reporting a vulnerability
 

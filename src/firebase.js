@@ -200,12 +200,13 @@ export class FirebaseClient {
   }
 
   /**
-   * Atomic batch. Each write: { path, data, mode: 'create' | 'update' | 'set', fields?: string[] }.
+   * Atomic batch. Each write: { path, data, mode: 'create' | 'update' | 'set' } or { path, mode: 'delete' }.
    * Fields set to REQUEST_TIME become server timestamps. Returns per-write transform results.
    */
   async commit(writes) {
     const body = {
       writes: writes.map((w) => {
+        if (w.mode === 'delete') return { delete: this.docName(w.path) };
         const out = { update: { name: this.docName(w.path), fields: encodeFields(w.data) } };
         const serverTime = Object.entries(w.data).filter(([, v]) => v === REQUEST_TIME).map(([k]) => k);
         if (serverTime.length) out.updateTransforms = serverTime.map((fieldPath) => ({ fieldPath, setToServerValue: 'REQUEST_TIME' }));

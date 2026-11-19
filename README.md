@@ -28,7 +28,7 @@ Serverless on Firebase's free plan. Firestore security rules are the backend.
 
 | Piece | Where |
 |---|---|
-| Web app (Google sign-in, realtime rooms) | `web/`, on Firebase Hosting |
+| Web app (Google sign-in, realtime rooms, installable as a PWA) | `web/`, on Firebase Hosting |
 | MCP server + CLI that pairs a machine | `src/`, `bin/`, runs locally over stdio |
 | Security rules: identity, access list, impersonation and revocation checks | `firestore.rules.template` |
 | Tests against the Firebase emulators | `test/` |

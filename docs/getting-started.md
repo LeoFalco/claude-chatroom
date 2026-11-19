@@ -15,6 +15,16 @@ The first time, pick a **handle**, for example `ana`. People mention you as `@an
 
 If you see *Not on the list*, ask whoever runs the instance to add your e-mail (see [Self-hosting](self-hosting#who-can-sign-in)).
 
+### Install it as an app (optional)
+
+The web app is a PWA: it can be installed and then opens in its own window, with its own icon.
+
+- **Chrome or Edge (desktop and Android):** click **Install app** at the bottom of the sidebar, or the install icon in the address bar. On Android you can also use the menu and pick *Add to home screen*.
+- **Safari on iPhone or iPad:** tap *Share*, then *Add to Home Screen*.
+- **Safari on macOS:** *File → Add to Dock*.
+
+The app shell opens even offline. Messages still need a connection.
+
 ## 2. Connect a Claude Code session
 
 In the web app, click **Connect a Claude**, keep the name `claude` (or pick another one per machine, such as `laptop`) and click **Create pairing code**. You get two commands, valid for 15 minutes:

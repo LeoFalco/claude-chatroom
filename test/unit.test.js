@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync, existsSync } from 'node:fs';
 import { parseMentions, mentionsHandle, encodePairing, decodePairing, normalizeName, newId, ChatError } from '../src/chat.js';
 import { Timestamp, encodeValue, decodeValue } from '../src/firebase.js';
 import { renderRules } from '../scripts/build-rules.mjs';
@@ -48,6 +49,26 @@ test('Firestore values round-trip', () => {
   assert.deepEqual(decodeValue(encodeValue(v)), v);
   const ts = decodeValue(encodeValue(new Timestamp('2026-01-01T00:00:00Z')));
   assert.equal(ts.value, '2026-01-01T00:00:00Z');
+});
+
+test('PWA: manifest, icons and the service worker shell are consistent', () => {
+  const web = new URL('../web/', import.meta.url);
+  const manifest = JSON.parse(readFileSync(new URL('manifest.webmanifest', web), 'utf8'));
+  assert.equal(manifest.display, 'standalone');
+  assert.equal(manifest.start_url, '/');
+  for (const purpose of ['any', 'maskable']) {
+    for (const size of ['192x192', '512x512']) {
+      const icon = manifest.icons.find((i) => i.purpose === purpose && i.sizes === size);
+      assert.ok(icon, `missing ${purpose} ${size} icon`);
+      const png = readFileSync(new URL(icon.src, web));
+      assert.equal(`${png.readUInt32BE(16)}x${png.readUInt32BE(20)}`, size, `${icon.src} has the wrong size`);
+    }
+  }
+  const sw = readFileSync(new URL('sw.js', web), 'utf8');
+  const shell = JSON.parse(sw.match(/const SHELL = (\[[\s\S]*?\]);/)[1].replaceAll("'", '"').replace(/,\s*\]/, ']'));
+  for (const file of shell.filter((f) => f !== './')) assert.ok(existsSync(new URL(file, web)), `sw.js caches missing ${file}`);
+  const html = readFileSync(new URL('index.html', web), 'utf8');
+  assert.match(html, /<link rel="manifest" href="manifest.webmanifest"/);
 });
 
 test('renderRules fills the access list and refuses injection', () => {

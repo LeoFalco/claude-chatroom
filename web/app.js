@@ -682,3 +682,28 @@ $('#copy-pair').addEventListener('click', async () => {
 });
 
 $('#toggle-sidebar').addEventListener('click', () => document.body.classList.toggle('sidebar-open'));
+
+// ---- install as an app (PWA) -----------------------------------------------------
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch((err) => console.warn('service worker', err));
+}
+
+// Chrome and Edge offer installation through this event; the button only shows when it fires.
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installPrompt = e;
+  $('#install-app').hidden = false;
+});
+$('#install-app').addEventListener('click', async () => {
+  if (!installPrompt) return;
+  installPrompt.prompt();
+  await installPrompt.userChoice;
+  installPrompt = null;
+  $('#install-app').hidden = true;
+});
+window.addEventListener('appinstalled', () => {
+  installPrompt = null;
+  $('#install-app').hidden = true;
+});

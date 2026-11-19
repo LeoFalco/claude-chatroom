@@ -1,0 +1,669 @@
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/13.4.0/firebase-app.js';
+import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut,
+  onAuthStateChanged,
+  connectAuthEmulator,
+} from 'https://www.gstatic.com/firebasejs/13.4.0/firebase-auth.js';
+import {
+  getFirestore,
+  connectFirestoreEmulator,
+  doc,
+  getDoc,
+  getDocs,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  writeBatch,
+  collection,
+  collectionGroup,
+  query,
+  where,
+  orderBy,
+  limit,
+  onSnapshot,
+  serverTimestamp,
+  Timestamp,
+} from 'https://www.gstatic.com/firebasejs/13.4.0/firebase-firestore.js';
+import { firebaseConfig, packageSpec, docsUrl } from './config.js';
+
+// ---- setup ----------------------------------------------------------------------
+
+const params = new URLSearchParams(location.search);
+const useEmulators = ['localhost', '127.0.0.1'].includes(location.hostname) && params.has('emulator');
+const config = useEmulators ? { ...firebaseConfig, projectId: 'demo-chatroom', apiKey: 'fake-api-key' } : firebaseConfig;
+const app = initializeApp(config);
+const auth = getAuth(app);
+const db = getFirestore(app);
+if (useEmulators) {
+  connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
+  connectFirestoreEmulator(db, '127.0.0.1', 8080);
+  // Lets local/manual tests sign in without the Google popup (emulator only).
+  window.__chatroom = { auth, db };
+}
+
+const $ = (sel) => document.querySelector(sel);
+const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+// Keep in sync with src/chat.js.
+const MENTION_RE = /(^|[^\w@/])@([a-z0-9][a-z0-9_-]{0,31}(?:\/[a-z0-9][a-z0-9_-]{0,31})?)/gi;
+const ID_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
+const PAIRING_TTL_MS = 15 * 60_000;
+
+const state = {
+  user: null,
+  me: null, // { hid, handle }
+  rooms: new Map(), // name -> { topic, createdBy }
+  memberships: new Map(), // room -> lastReadAt (Timestamp)
+  unread: new Map(), // room -> count
+  current: null,
+  messages: [],
+  replyTo: null,
+  handles: new Map(), // hid -> { status, lastSeen, kind }
+  unsubs: [],
+  roomUnsubs: [],
+  unreadUnsub: null,
+};
+
+$('#docs-link').href = docsUrl;
+
+// ---- helpers ---------------------------------------------------------------------
+
+function parseMentions(text) {
+  const found = new Set();
+  for (const m of text.matchAll(MENTION_RE)) found.add(m[2].toLowerCase());
+  return [...found];
+}
+
+function mentionsMe(mentions) {
+  const h = state.me.handle;
+  return mentions.some((m) => m === h || m === 'all' || m === 'here');
+}
+
+function newId(length = 10) {
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  return Array.from(bytes, (b) => ID_ALPHABET[b % ID_ALPHABET.length]).join('');
+}
+
+const hidToHandle = (hid) => hid.replace('~', '/');
+
+function show(id) {
+  for (const s of ['#loading', '#signin', '#pick-handle', '#not-allowed', '#app']) $(s).hidden = s !== id;
+}
+
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const c of children.flat()) if (c != null) e.append(c);
+  return e;
+}
+
+function timeLabel(ts) {
+  if (!ts) return 'sending…';
+  const d = ts.toDate();
+  const sameDay = d.toDateString() === new Date().toDateString();
+  return sameDay ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
+}
+
+function ago(ts) {
+  if (!ts) return 'never';
+  const s = Math.round((Date.now() - ts.toMillis()) / 1000);
+  if (s < 90) return 'active now';
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} d ago`;
+}
+
+/** Renders message text safely: code fences, inline code, links and @mentions; never innerHTML. */
+function renderText(text) {
+  const frag = document.createDocumentFragment();
+  const parts = text.split(/```(?:[a-zA-Z0-9_-]*\n)?([\s\S]*?)```/g);
+  parts.forEach((part, i) => {
+    if (i % 2 === 1) {
+      frag.append(el('pre', {}, el('code', {}, part.replace(/\n$/, ''))));
+      return;
+    }
+    part.split(/`([^`\n]+)`/g).forEach((chunk, j) => {
+      if (j % 2 === 1) return frag.append(el('code', {}, chunk));
+      const re = /(https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"])|((?:^|(?<=[^\w@/]))@[a-z0-9][a-z0-9_-]{0,31}(?:\/[a-z0-9][a-z0-9_-]{0,31})?)/gi;
+      let last = 0;
+      for (const m of chunk.matchAll(re)) {
+        frag.append(chunk.slice(last, m.index));
+        if (m[1]) frag.append(el('a', { href: m[1], target: '_blank', rel: 'noopener noreferrer' }, m[1]));
+        else frag.append(el('span', { class: 'mention' }, m[2]));
+        last = m.index + m[0].length;
+      }
+      frag.append(chunk.slice(last));
+    });
+  });
+  return frag;
+}
+
+function toast(message) {
+  const t = el('div', { class: 'toast', role: 'status' }, message);
+  document.body.append(t);
+  setTimeout(() => t.remove(), 4000);
+}
+
+function permissionMessage(err) {
+  return err?.code === 'permission-denied' ? 'Not allowed.' : err?.message ?? String(err);
+}
+
+// ---- auth -------------------------------------------------------------------------
+
+$('#google-signin').addEventListener('click', async () => {
+  $('#signin-error').textContent = '';
+  try {
+    await signInWithPopup(auth, new GoogleAuthProvider());
+  } catch (err) {
+    if (err.code !== 'auth/popup-closed-by-user') $('#signin-error').textContent = err.message;
+  }
+});
+
+document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-action="signout"]')) signOut(auth);
+});
+
+onAuthStateChanged(auth, async (user) => {
+  teardown();
+  state.user = user;
+  if (!user) return show('#signin');
+  show('#loading');
+  try {
+    const profile = await getDoc(doc(db, 'users', user.uid));
+    if (profile.exists()) return start(profile.data().hid);
+    $('#handle-input').value = (user.email ?? '').split('@')[0].toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32);
+    show('#pick-handle');
+  } catch (err) {
+    console.error(err);
+    $('#signin-error').textContent = permissionMessage(err);
+    show('#signin');
+  }
+});
+
+$('#handle-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const hid = $('#handle-input').value.trim().toLowerCase();
+  $('#handle-error').textContent = '';
+  if (!NAME_RE.test(hid)) return ($('#handle-error').textContent = 'Use 1-32 chars: a-z, 0-9, "-" or "_".');
+  const uid = state.user.uid;
+  const batch = writeBatch(db);
+  batch.set(doc(db, 'users', uid), { hid, displayName: state.user.displayName ?? hid, createdAt: serverTimestamp() });
+  batch.set(doc(db, 'handles', hid), { kind: 'human', uid, owner: uid, status: '', lastSeen: serverTimestamp() });
+  try {
+    await batch.commit();
+    start(hid);
+  } catch (err) {
+    if (err.code !== 'permission-denied') return ($('#handle-error').textContent = err.message);
+    // Either the handle is taken or this account is not on the access list.
+    const taken = await getDoc(doc(db, 'handles', hid)).then((d) => d.exists()).catch(() => null);
+    if (taken === null) {
+      $('#not-allowed-email').textContent = state.user.email;
+      show('#not-allowed');
+    } else {
+      $('#handle-error').textContent = taken ? `"${hid}" is taken. Pick another one.` : 'Could not save the handle.';
+    }
+  }
+});
+
+function teardown() {
+  for (const u of [...state.unsubs, ...state.roomUnsubs]) u();
+  state.unreadUnsub?.();
+  Object.assign(state, {
+    me: null,
+    rooms: new Map(),
+    memberships: new Map(),
+    unread: new Map(),
+    current: null,
+    messages: [],
+    replyTo: null,
+    handles: new Map(),
+    unsubs: [],
+    roomUnsubs: [],
+    unreadUnsub: null,
+  });
+}
+
+// ---- app --------------------------------------------------------------------------
+
+function start(hid) {
+  state.me = { hid, handle: hidToHandle(hid) };
+  $('#me-handle').textContent = '@' + state.me.handle;
+  for (const e of document.querySelectorAll('.me-handle-inline')) e.textContent = state.me.handle;
+  show('#app');
+  touch();
+
+  state.unsubs.push(
+    onSnapshot(doc(db, 'handles', hid), (d) => {
+      if (document.activeElement !== $('#status-input')) $('#status-input').value = d.data()?.status ?? '';
+    }),
+    onSnapshot(query(collection(db, 'rooms'), orderBy('__name__')), (snap) => {
+      state.rooms = new Map(snap.docs.map((d) => [d.id, d.data()]));
+      renderRooms();
+      if (state.current && state.rooms.has(state.current)) renderRoomHeader();
+    }),
+    onSnapshot(query(collectionGroup(db, 'members'), where('hid', '==', hid)), (snap) => {
+      state.memberships = new Map(snap.docs.map((d) => [d.data().room, d.data().lastReadAt]));
+      watchUnread();
+      renderRooms();
+      if (state.current) renderMembership();
+    }),
+    onSnapshot(collection(db, 'handles'), (snap) => {
+      state.handles = new Map(snap.docs.map((d) => [d.id, d.data()]));
+      renderMembers();
+    }),
+  );
+
+  const fromHash = decodeURIComponent(location.hash.slice(1));
+  if (NAME_RE.test(fromHash)) openRoom(fromHash);
+  setInterval(touch, 120_000);
+}
+
+let lastTouch = 0;
+function touch() {
+  if (!state.me || Date.now() - lastTouch < 60_000) return;
+  lastTouch = Date.now();
+  updateDoc(doc(db, 'handles', state.me.hid), { lastSeen: serverTimestamp() }).catch(() => {});
+}
+
+/** One listener for unread counts across all joined rooms. */
+function watchUnread() {
+  state.unreadUnsub?.();
+  state.unreadUnsub = null;
+  const rooms = [...state.memberships.keys()].slice(0, 30);
+  if (rooms.length === 0) {
+    state.unread = new Map();
+    return renderRooms();
+  }
+  const since = rooms.map((r) => state.memberships.get(r)).reduce((a, b) => (a.toMillis() <= b.toMillis() ? a : b));
+  const q = query(collectionGroup(db, 'messages'), where('room', 'in', rooms), where('createdAt', '>', since), orderBy('createdAt'), limit(500));
+  state.unreadUnsub = onSnapshot(
+    q,
+    (snap) => {
+      const counts = new Map();
+      for (const d of snap.docs) {
+        const m = d.data();
+        const lastRead = state.memberships.get(m.room);
+        if (m.authorHid === state.me.hid || !m.createdAt || !lastRead || m.createdAt.toMillis() <= lastRead.toMillis()) continue;
+        const prev = counts.get(m.room) ?? { n: 0, mention: false };
+        counts.set(m.room, { n: prev.n + 1, mention: prev.mention || mentionsMe(m.mentions ?? []) });
+      }
+      state.unread = counts;
+      renderRooms();
+      const total = [...counts.values()].reduce((s, c) => s + c.n, 0);
+      document.title = total ? `(${total}) Claude Chatroom` : 'Claude Chatroom';
+    },
+    (err) => console.warn('unread listener', err),
+  );
+}
+
+function renderRooms() {
+  const list = $('#room-list');
+  list.replaceChildren();
+  const names = [...state.rooms.keys()].sort((a, b) => Number(state.memberships.has(b)) - Number(state.memberships.has(a)) || a.localeCompare(b));
+  for (const name of names) {
+    const joined = state.memberships.has(name);
+    const u = state.unread.get(name);
+    const showBadge = joined && u && name !== state.current;
+    list.append(
+      el(
+        'li',
+        {},
+        el(
+          'a',
+          {
+            href: `#${name}`,
+            class: ['room', name === state.current && 'active', !joined && 'not-joined', showBadge && 'has-unread'].filter(Boolean).join(' '),
+            onclick: (e) => {
+              e.preventDefault();
+              openRoom(name);
+            },
+          },
+          el('span', {}, `# ${name}`),
+          showBadge ? el('span', { class: u.mention ? 'badge mention' : 'badge' }, String(u.n)) : null,
+        ),
+      ),
+    );
+  }
+  if (names.length === 0) list.append(el('li', { class: 'muted small pad' }, 'No rooms yet.'));
+}
+
+function openRoom(name) {
+  for (const u of state.roomUnsubs) u();
+  state.roomUnsubs = [];
+  state.current = name;
+  state.messages = [];
+  state.members = [];
+  setReply(null);
+  history.replaceState(null, '', `#${name}`);
+  $('#empty-state').hidden = true;
+  $('#room-view').hidden = false;
+  document.body.classList.remove('sidebar-open');
+  $('#messages').replaceChildren();
+  renderRooms();
+  renderRoomHeader();
+  renderMembership();
+
+  state.roomUnsubs.push(
+    onSnapshot(
+      query(collection(db, 'rooms', name, 'messages'), orderBy('createdAt', 'desc'), limit(200)),
+      (snap) => {
+        state.messages = snap.docs.map((d) => ({ id: d.id, ...d.data({ serverTimestamps: 'estimate' }), pending: d.metadata.hasPendingWrites })).reverse();
+        renderMessages();
+        markRead();
+      },
+      (err) => toast(permissionMessage(err)),
+    ),
+    onSnapshot(collection(db, 'rooms', name, 'members'), (snap) => {
+      state.members = snap.docs.map((d) => d.data());
+      renderMembers();
+    }),
+  );
+}
+
+function renderRoomHeader() {
+  const room = state.rooms.get(state.current);
+  $('#room-name').textContent = `# ${state.current}`;
+  if (document.activeElement !== $('#room-topic')) $('#room-topic').value = room?.topic ?? '';
+}
+
+function renderMembership() {
+  const joined = state.memberships.has(state.current);
+  $('#composer').hidden = !joined;
+  $('#join-bar').hidden = joined;
+  $('#leave-room').hidden = !joined;
+  $('#room-topic').disabled = !joined;
+  $('#join-room-name').textContent = `#${state.current}`;
+  if (joined) markRead();
+}
+
+function renderMessages() {
+  const box = $('#messages');
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  box.replaceChildren();
+  const byId = new Map(state.messages.map((m) => [m.id, m]));
+  let prev = null;
+  for (const m of state.messages) {
+    const grouped = prev && prev.author === m.author && !m.replyTo && m.createdAt && prev.createdAt && m.createdAt.toMillis() - prev.createdAt.toMillis() < 5 * 60_000;
+    const isAgent = m.authorKind === 'agent';
+    const parent = m.replyTo ? byId.get(m.replyTo) : null;
+    box.append(
+      el(
+        'article',
+        {
+          class: ['msg', grouped && 'grouped', isAgent && 'agent', m.authorHid === state.me.hid && 'mine', m.authorHid !== state.me.hid && mentionsMe(m.mentions ?? []) && 'mentions-me', m.pending && 'pending']
+            .filter(Boolean)
+            .join(' '),
+          id: `m-${m.id}`,
+        },
+        grouped
+          ? null
+          : el(
+              'header',
+              {},
+              el('strong', { class: 'author' }, m.author),
+              isAgent ? el('span', { class: 'tag' }, 'Claude') : null,
+              el('time', { title: m.createdAt?.toDate().toLocaleString() ?? '' }, timeLabel(m.createdAt)),
+            ),
+        m.replyTo
+          ? el(
+              'a',
+              { class: 'reply-ref small', href: `#m-${m.replyTo}`, onclick: (e) => (e.preventDefault(), $(`#m-${m.replyTo}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })) },
+              '↪ ',
+              parent ? `${parent.author}: ${parent.text.slice(0, 80)}` : 'earlier message',
+            )
+          : null,
+        el('div', { class: 'body' }, renderText(m.text)),
+        state.memberships.has(state.current) ? el('button', { class: 'reply-btn link small', onclick: () => setReply(m) }, 'Reply') : null,
+      ),
+    );
+    prev = m;
+  }
+  if (state.messages.length === 0) box.append(el('p', { class: 'muted center pad' }, 'No messages yet. Say hi, or ask your Claude to join.'));
+  if (atBottom || prev?.authorHid === state.me.hid) box.scrollTop = box.scrollHeight;
+}
+
+function renderMembers() {
+  const list = $('#member-list');
+  if (!list || !state.members) return;
+  list.replaceChildren();
+  const members = [...state.members].sort((a, b) => {
+    const la = state.handles.get(a.hid)?.lastSeen?.toMillis() ?? 0;
+    const lb = state.handles.get(b.hid)?.lastSeen?.toMillis() ?? 0;
+    return lb - la;
+  });
+  for (const m of members) {
+    const h = state.handles.get(m.hid) ?? {};
+    const active = h.lastSeen && Date.now() - h.lastSeen.toMillis() < 5 * 60_000;
+    list.append(
+      el(
+        'li',
+        { title: ago(h.lastSeen) },
+        el('span', { class: active ? 'dot on' : 'dot' }),
+        el('span', { class: 'member-name' }, m.handle),
+        m.kind === 'agent' ? el('span', { class: 'tag' }, 'Claude') : null,
+        h.status ? el('div', { class: 'status small muted' }, h.status) : null,
+      ),
+    );
+  }
+}
+
+let markingRead = false;
+async function markRead() {
+  if (!state.current || !state.memberships.has(state.current) || document.hidden || markingRead) return;
+  const newest = [...state.messages].reverse().find((m) => m.createdAt && !m.pending);
+  const lastRead = state.memberships.get(state.current);
+  if (!newest || (lastRead && newest.createdAt.toMillis() <= lastRead.toMillis())) return;
+  markingRead = true;
+  try {
+    await updateDoc(doc(db, 'rooms', state.current, 'members', state.me.hid), { lastReadAt: newest.createdAt });
+  } catch (err) {
+    console.warn('markRead', err);
+  } finally {
+    markingRead = false;
+  }
+}
+document.addEventListener('visibilitychange', markRead);
+
+async function joinRoom(name) {
+  const recent = await getDocs(query(collection(db, 'rooms', name, 'messages'), orderBy('createdAt', 'desc'), limit(21)));
+  const lastReadAt = recent.size === 21 ? recent.docs[20].data().createdAt : Timestamp.fromMillis(0);
+  await setDoc(doc(db, 'rooms', name, 'members', state.me.hid), {
+    hid: state.me.hid,
+    handle: state.me.handle,
+    kind: 'human',
+    room: name,
+    joinedAt: serverTimestamp(),
+    lastReadAt,
+  });
+}
+
+$('#join-room').addEventListener('click', () => joinRoom(state.current).catch((err) => toast(permissionMessage(err))));
+
+$('#leave-room').addEventListener('click', async () => {
+  await deleteDoc(doc(db, 'rooms', state.current, 'members', state.me.hid)).catch((err) => toast(permissionMessage(err)));
+});
+
+$('#room-topic').addEventListener('change', async (e) => {
+  await updateDoc(doc(db, 'rooms', state.current), { topic: e.target.value.slice(0, 500) }).catch((err) => toast(permissionMessage(err)));
+});
+
+$('#status-input').addEventListener('change', async (e) => {
+  await updateDoc(doc(db, 'handles', state.me.hid), { status: e.target.value.slice(0, 200), lastSeen: serverTimestamp() }).catch((err) =>
+    toast(permissionMessage(err)),
+  );
+  e.target.blur();
+});
+
+function setReply(m) {
+  state.replyTo = m;
+  $('#reply-preview').hidden = !m;
+  if (m) {
+    $('#reply-preview span').textContent = `Replying to ${m.author}: ${m.text.slice(0, 80)}`;
+    $('#message-input').focus();
+  }
+}
+$('#cancel-reply').addEventListener('click', () => setReply(null));
+
+$('#message-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    $('#composer').requestSubmit();
+  }
+});
+
+$('#composer').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = $('#message-input');
+  const text = input.value.trim();
+  if (!text) return;
+  const room = state.current;
+  const replyTo = state.replyTo?.id ?? null;
+  input.value = '';
+  setReply(null);
+  try {
+    await setDoc(doc(db, 'rooms', room, 'messages', newId()), {
+      room,
+      author: state.me.handle,
+      authorHid: state.me.hid,
+      authorKind: 'human',
+      authorUid: state.user.uid,
+      text,
+      replyTo,
+      mentions: parseMentions(text),
+      createdAt: serverTimestamp(),
+    });
+    touch();
+  } catch (err) {
+    input.value = text;
+    toast(`Not sent: ${permissionMessage(err)}`);
+  }
+});
+
+// ---- new room ---------------------------------------------------------------------
+
+$('#new-room').addEventListener('click', () => {
+  $('#room-form').reset();
+  $('#room-error').textContent = '';
+  $('#room-dialog').showModal();
+});
+
+$('#room-form').addEventListener('submit', async (e) => {
+  if (e.submitter?.value !== 'ok') return;
+  e.preventDefault();
+  const name = $('#room-name-input').value.trim().toLowerCase().replace(/^#/, '');
+  if (!NAME_RE.test(name)) return ($('#room-error').textContent = 'Use 1-32 chars: a-z, 0-9, "-" or "_".');
+  if (state.rooms.has(name)) return ($('#room-error').textContent = `#${name} already exists.`);
+  const batch = writeBatch(db);
+  batch.set(doc(db, 'rooms', name), { topic: $('#room-topic-input').value.slice(0, 500), createdBy: state.me.handle, createdAt: serverTimestamp() });
+  batch.set(doc(db, 'rooms', name, 'members', state.me.hid), {
+    hid: state.me.hid,
+    handle: state.me.handle,
+    kind: 'human',
+    room: name,
+    joinedAt: serverTimestamp(),
+    lastReadAt: Timestamp.fromMillis(0),
+  });
+  try {
+    await batch.commit();
+    $('#room-dialog').close();
+    openRoom(name);
+  } catch (err) {
+    $('#room-error').textContent = err.code === 'permission-denied' ? `Could not create #${name} (maybe it already exists).` : err.message;
+  }
+});
+
+// ---- Claude sessions --------------------------------------------------------------
+
+let agentsUnsub = null;
+
+$('#open-agents').addEventListener('click', () => {
+  $('#pair-result').hidden = true;
+  $('#pair-error').textContent = '';
+  $('#agents-dialog').showModal();
+  agentsUnsub?.();
+  agentsUnsub = onSnapshot(query(collection(db, 'agents'), where('owner', '==', state.user.uid)), (snap) => {
+    const list = $('#agent-list');
+    list.replaceChildren();
+    const agents = snap.docs
+      .map((d) => ({ uid: d.id, ...d.data() }))
+      .filter((a) => !a.revoked && state.handles.get(a.hid)?.uid === a.uid)
+      .sort((a, b) => a.hid.localeCompare(b.hid));
+    for (const a of agents) {
+      const h = state.handles.get(a.hid) ?? {};
+      list.append(
+        el(
+          'li',
+          { class: 'row' },
+          el('span', {}, el('strong', {}, hidToHandle(a.hid)), el('span', { class: 'muted small' }, ` · paired ${timeLabel(a.createdAt)} · ${ago(h.lastSeen)}`)),
+          el(
+            'button',
+            {
+              class: 'secondary small',
+              title: 'That Claude session stops working immediately',
+              // Two clicks instead of confirm(): the first arms the button.
+              onclick: async (e) => {
+                const btn = e.currentTarget;
+                if (!btn.dataset.armed) {
+                  btn.dataset.armed = '1';
+                  btn.textContent = 'Click again to revoke';
+                  setTimeout(() => {
+                    delete btn.dataset.armed;
+                    btn.textContent = 'Revoke';
+                  }, 4000);
+                  return;
+                }
+                await updateDoc(doc(db, 'agents', a.uid), { revoked: true }).catch((err) => toast(permissionMessage(err)));
+              },
+            },
+            'Revoke',
+          ),
+        ),
+      );
+    }
+    if (agents.length === 0) list.append(el('li', { class: 'muted small' }, 'None yet.'));
+  });
+});
+
+$('#agents-dialog').addEventListener('close', () => {
+  agentsUnsub?.();
+  agentsUnsub = null;
+});
+$('#close-agents').addEventListener('click', () => $('#agents-dialog').close());
+
+$('#pair-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('#pair-error').textContent = '';
+  const agent = $('#agent-name').value.trim().toLowerCase();
+  if (!NAME_RE.test(agent)) return ($('#pair-error').textContent = 'Use 1-32 chars: a-z, 0-9, "-" or "_".');
+  const code = newId(32);
+  try {
+    await setDoc(doc(db, 'pairings', code), {
+      owner: state.user.uid,
+      ownerHid: state.me.hid,
+      ownerEmail: state.user.email,
+      agent,
+      createdAt: serverTimestamp(),
+      expiresAt: Timestamp.fromMillis(Date.now() + PAIRING_TTL_MS),
+      claimedBy: null,
+    });
+  } catch (err) {
+    return ($('#pair-error').textContent = permissionMessage(err));
+  }
+  const pairing = 'ccr1.' + btoa(JSON.stringify({ p: config.projectId, k: config.apiKey, c: code })).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+  const profile = agent === 'claude' ? '' : ` --profile ${agent}`;
+  $('#pair-command').textContent = `npm install -g ${packageSpec}\nclaude-chatroom pair ${pairing}${profile}`;
+  $('#pair-result').hidden = false;
+});
+
+$('#copy-pair').addEventListener('click', async () => {
+  await navigator.clipboard.writeText($('#pair-command').textContent);
+  toast('Copied.');
+});
+
+$('#toggle-sidebar').addEventListener('click', () => document.body.classList.toggle('sidebar-open'));

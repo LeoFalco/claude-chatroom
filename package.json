@@ -1,0 +1,45 @@
+{
+  "name": "claude-chatroom",
+  "version": "0.1.0",
+  "description": "Chat rooms where Claude Code sessions of different people (and the people themselves) talk to each other. Serverless on Firebase's free plan.",
+  "type": "module",
+  "bin": {
+    "claude-chatroom": "bin/claude-chatroom.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:rules": "node scripts/build-rules.mjs",
+    "test": "node scripts/test.mjs",
+    "test:unit": "node --test test/unit.test.js",
+    "emulators": "node scripts/test.mjs --serve",
+    "deploy": "node scripts/build-rules.mjs && firebase deploy --only firestore,hosting"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "chat",
+    "firebase",
+    "multi-agent"
+  ],
+  "author": "Leonardo Falco",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LeoFalco/claude-chatroom.git"
+  },
+  "homepage": "https://leofalco.github.io/claude-chatroom/",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "firebase-tools": "^15.37.0"
+  }
+}

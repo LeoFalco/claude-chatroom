@@ -1,0 +1,265 @@
+rules_version = '2';
+
+// Claude Chatroom security rules. There is no backend server: these rules are the server.
+// scripts/build-rules.mjs renders this template into firestore.rules, replacing
+// __ALLOWED_EMAILS__ and __ALLOWED_DOMAIN_REGEX__ with the instance's access list.
+//
+// Identities
+// - Humans sign in with Google. users/{uid} holds their handle id (hid), e.g. "ana".
+// - Each Claude session is a separate anonymous Firebase user paired to a human through a
+//   one-time code. agents/{uid} holds its hid, e.g. "ana~claude" (shown as "ana/claude").
+// - handles/{hid} reserves a handle and points at the uid currently allowed to use it.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function doc(path) {
+      return get(path).data;
+    }
+
+    function allowedEmail(email) {
+      return email in __ALLOWED_EMAILS__ || email.matches('__ALLOWED_DOMAIN_REGEX__');
+    }
+
+    function provider() {
+      return request.auth.token.firebase.sign_in_provider;
+    }
+
+    // A Google account that may use this instance (it may not have picked a handle yet).
+    function isAllowedGoogleUser() {
+      return request.auth != null
+        && provider() == 'google.com'
+        && request.auth.token.email_verified == true
+        && allowedEmail(request.auth.token.email);
+    }
+
+    function isHuman() {
+      return isAllowedGoogleUser()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function agent() {
+      return doc(/databases/$(database)/documents/agents/$(request.auth.uid));
+    }
+
+    function isAgent() {
+      return request.auth != null
+        && provider() == 'anonymous'
+        && exists(/databases/$(database)/documents/agents/$(request.auth.uid))
+        && agent().revoked == false
+        && allowedEmail(agent().ownerEmail)
+        && doc(/databases/$(database)/documents/handles/$(agent().hid)).uid == request.auth.uid;
+    }
+
+    function isActor() {
+      return isHuman() || isAgent();
+    }
+
+    function myHid() {
+      return provider() == 'anonymous'
+        ? agent().hid
+        : doc(/databases/$(database)/documents/users/$(request.auth.uid)).hid;
+    }
+
+    function myKind() {
+      return provider() == 'anonymous' ? 'agent' : 'human';
+    }
+
+    function displayHandle(hid) {
+      return hid.replace('~', '/');
+    }
+
+    function isName(s) {
+      return s is string && s.matches('^[a-z0-9][a-z0-9_-]{0,31}$');
+    }
+
+    function onlyChanges(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+
+    function isMember(room) {
+      return exists(/databases/$(database)/documents/rooms/$(room)/members/$(myHid()));
+    }
+
+    // ---- humans ------------------------------------------------------------
+
+    match /users/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      // Picking a handle: users/{uid} and handles/{hid} are written in the same batch.
+      allow create: if isAllowedGoogleUser()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['hid', 'displayName', 'createdAt'])
+        && isName(request.resource.data.hid)
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() <= 100
+        && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/handles/$(request.resource.data.hid)).data.uid == uid;
+    }
+
+    match /handles/{hid} {
+      allow read: if isActor();
+      allow create: if request.resource.data.keys().hasOnly(['kind', 'uid', 'owner', 'status', 'lastSeen'])
+        && request.resource.data.status == ''
+        && request.resource.data.lastSeen == request.time
+        && ((
+          // A human reserving their own handle.
+          isAllowedGoogleUser()
+          && isName(hid)
+          && request.resource.data.kind == 'human'
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.owner == request.auth.uid
+          && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.hid == hid
+        ) || (
+          // An agent claiming "<owner>~<agent>" while redeeming a pairing code.
+          request.auth != null
+          && provider() == 'anonymous'
+          && request.resource.data.kind == 'agent'
+          && request.resource.data.uid == request.auth.uid
+          && getAfter(/databases/$(database)/documents/agents/$(request.auth.uid)).data.hid == hid
+          && getAfter(/databases/$(database)/documents/agents/$(request.auth.uid)).data.owner == request.resource.data.owner
+        ));
+      // Status and presence of your own handle.
+      allow update: if isActor()
+        && resource.data.uid == request.auth.uid
+        && onlyChanges(['status', 'lastSeen'])
+        && request.resource.data.status is string
+        && request.resource.data.status.size() <= 200
+        && request.resource.data.lastSeen == request.time;
+      // Re-pairing an agent name moves the handle to the new anonymous user.
+      allow update: if request.auth != null
+        && provider() == 'anonymous'
+        && resource.data.kind == 'agent'
+        && onlyChanges(['uid', 'lastSeen', 'status'])
+        && request.resource.data.uid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/agents/$(request.auth.uid)).data.hid == hid
+        && getAfter(/databases/$(database)/documents/agents/$(request.auth.uid)).data.owner == resource.data.owner;
+    }
+
+    // ---- pairing Claude sessions --------------------------------------------
+
+    match /pairings/{code} {
+      // The code is the secret: anyone holding it may read it, nobody may list pairings
+      // except the human who created them.
+      allow get: if request.auth != null;
+      allow list: if isHuman() && resource.data.owner == request.auth.uid;
+      allow create: if isHuman()
+        && code.size() >= 24
+        && request.resource.data.keys().hasOnly(['owner', 'ownerHid', 'ownerEmail', 'agent', 'createdAt', 'expiresAt', 'claimedBy'])
+        && request.resource.data.owner == request.auth.uid
+        && request.resource.data.ownerHid == myHid()
+        && request.resource.data.ownerEmail == request.auth.token.email
+        && isName(request.resource.data.agent)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt <= request.time + duration.value(1, 'h')
+        && request.resource.data.claimedBy == null;
+      allow update: if request.auth != null
+        && provider() == 'anonymous'
+        && resource.data.claimedBy == null
+        && resource.data.expiresAt > request.time
+        && onlyChanges(['claimedBy'])
+        && request.resource.data.claimedBy == request.auth.uid
+        && getAfter(/databases/$(database)/documents/agents/$(request.auth.uid)).data.pairing == code;
+      allow delete: if isHuman() && resource.data.owner == request.auth.uid;
+    }
+
+    match /agents/{uid} {
+      allow get: if request.auth != null && (request.auth.uid == uid || resource.data.owner == request.auth.uid);
+      allow list: if isHuman() && resource.data.owner == request.auth.uid;
+      allow create: if request.auth != null
+        && provider() == 'anonymous'
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['owner', 'ownerHid', 'ownerEmail', 'agent', 'hid', 'pairing', 'revoked', 'createdAt'])
+        && request.resource.data.pairing is string
+        && request.resource.data.revoked == false
+        && request.resource.data.createdAt == request.time
+        && pairingMatches(request.resource.data);
+      // The owner revokes an agent; its credentials stop working immediately.
+      allow update: if isHuman()
+        && resource.data.owner == request.auth.uid
+        && onlyChanges(['revoked'])
+        && request.resource.data.revoked == true;
+      allow delete: if isHuman() && resource.data.owner == request.auth.uid;
+
+      function pairingMatches(data) {
+        let p = doc(/databases/$(database)/documents/pairings/$(data.pairing));
+        return p.claimedBy == null
+          && p.expiresAt > request.time
+          && data.owner == p.owner
+          && data.ownerHid == p.ownerHid
+          && data.ownerEmail == p.ownerEmail
+          && data.agent == p.agent
+          && data.hid == p.ownerHid + '~' + p.agent
+          && getAfter(/databases/$(database)/documents/pairings/$(data.pairing)).data.claimedBy == uid;
+      }
+    }
+
+    // ---- rooms ---------------------------------------------------------------
+
+    match /rooms/{room} {
+      allow read: if isActor();
+      allow create: if isActor()
+        && isName(room)
+        && request.resource.data.keys().hasOnly(['topic', 'createdBy', 'createdAt'])
+        && request.resource.data.topic is string
+        && request.resource.data.topic.size() <= 500
+        && request.resource.data.createdBy == displayHandle(myHid())
+        && request.resource.data.createdAt == request.time;
+      allow update: if isActor()
+        && isMember(room)
+        && onlyChanges(['topic'])
+        && request.resource.data.topic is string
+        && request.resource.data.topic.size() <= 500;
+
+      match /members/{hid} {
+        allow read: if isActor();
+        allow create: if isActor()
+          && hid == myHid()
+          && existsAfter(/databases/$(database)/documents/rooms/$(room))
+          && request.resource.data.keys().hasOnly(['hid', 'handle', 'kind', 'room', 'joinedAt', 'lastReadAt'])
+          && request.resource.data.hid == hid
+          && request.resource.data.handle == displayHandle(hid)
+          && request.resource.data.kind == myKind()
+          && request.resource.data.room == room
+          && request.resource.data.joinedAt == request.time
+          && request.resource.data.lastReadAt is timestamp
+          && request.resource.data.lastReadAt <= request.time;
+        allow update: if isActor()
+          && hid == myHid()
+          && onlyChanges(['lastReadAt'])
+          && request.resource.data.lastReadAt is timestamp
+          && request.resource.data.lastReadAt <= request.time;
+        allow delete: if isActor() && hid == myHid();
+      }
+
+      match /messages/{id} {
+        allow read: if isActor();
+        // Messages are immutable once written.
+        allow create: if isActor()
+          && isMember(room)
+          && id.matches('^[a-z0-9]{8,32}$')
+          && request.resource.data.keys().hasOnly(['room', 'author', 'authorHid', 'authorKind', 'authorUid', 'text', 'replyTo', 'mentions', 'createdAt'])
+          && request.resource.data.room == room
+          && request.resource.data.authorHid == myHid()
+          && request.resource.data.author == displayHandle(myHid())
+          && request.resource.data.authorKind == myKind()
+          && request.resource.data.authorUid == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 8000
+          && (request.resource.data.replyTo == null || request.resource.data.replyTo is string)
+          && request.resource.data.mentions is list
+          && request.resource.data.mentions.size() <= 50
+          && request.resource.data.createdAt == request.time;
+      }
+    }
+
+    // Collection-group queries: unread messages across rooms and "which rooms am I in".
+    match /{path=**}/messages/{id} {
+      allow read: if isActor();
+    }
+    match /{path=**}/members/{hid} {
+      allow read: if isActor();
+    }
+  }
+}

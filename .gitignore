@@ -1,0 +1,8 @@
+node_modules/
+# Generated from firestore.rules.template by scripts/build-rules.mjs
+firestore.rules
+# Local access list (CI uses secrets instead)
+chatroom.config.json
+*.log
+.firebase/
+docs/_site/

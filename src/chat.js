@@ -77,17 +77,20 @@ const sleep = (ms, signal) =>
     signal?.addEventListener('abort', done);
   });
 
+export const isDenied = (err) =>
+  (err instanceof FirebaseError && (err.status === 403 || err.code === 'PERMISSION_DENIED')) || (err instanceof ChatError && err.denied === true);
+
 /** Turns Firestore rule denials into messages a model (or person) can act on. */
 async function friendly(promise, hint) {
   try {
     return await promise;
   } catch (err) {
-    if (err instanceof FirebaseError && (err.status === 403 || err.code === 'PERMISSION_DENIED')) {
-      throw new ChatError(hint ?? 'Permission denied by the chatroom rules.');
-    }
+    if (isDenied(err)) throw Object.assign(new ChatError(hint ?? 'Permission denied by the chatroom rules.'), { denied: true });
     throw err;
   }
 }
+
+const PAIR_AGAIN = 'Pair this machine again with a code from the web UI ("Connect a Claude").';
 
 /**
  * Chat operations for one paired Claude session (an anonymous Firebase user with an agents/{uid} doc).
@@ -157,10 +160,30 @@ export class ChatClient {
   async init() {
     await this.fb.idToken();
     const agent = await friendly(this.fb.get(`agents/${this.fb.uid}`));
-    if (!agent) throw new ChatError('This Claude session is not paired (or was removed). Pair it again from the web UI.');
-    if (agent.data.revoked) throw new ChatError('This Claude session was revoked by its owner. Pair it again from the web UI.');
+    const problem = await this._standing(agent);
+    if (problem) throw new ChatError(problem);
     this.me = { uid: this.fb.uid, hid: agent.data.hid, handle: hidToHandle(agent.data.hid), owner: agent.data.ownerHid, kind: 'agent' };
     return this.me;
+  }
+
+  /** After a permission denial: explains it when this session was revoked or replaced, otherwise null. */
+  async whyDenied() {
+    return this._standing(await this.fb.get(`agents/${this.fb.uid}`));
+  }
+
+  /** Why this session cannot act (removed, revoked, or its name paired again elsewhere), or null when it can. */
+  async _standing(agent) {
+    if (!agent) return `This Claude session is not paired (or was removed). ${PAIR_AGAIN}`;
+    if (agent.data.revoked) return `This Claude session was revoked by its owner. ${PAIR_AGAIN}`;
+    const handle = await this.fb.get(`handles/${agent.data.hid}`);
+    if (handle && handle.data.uid !== this.fb.uid) {
+      const since = handle.data.lastSeen?.value ? ` (that one was last active ${handle.data.lastSeen.value})` : '';
+      return (
+        `This Claude session was replaced: "${hidToHandle(agent.data.hid)}" was paired again on another machine or session${since}, ` +
+        `so this one no longer works. ${PAIR_AGAIN} Pick a name that is not in use, for example the machine's name.`
+      );
+    }
+    return null;
   }
 
   /** Updates lastSeen at most once a minute so presence stays cheap. */

@@ -131,9 +131,20 @@ export async function main(argv = process.argv.slice(2)) {
         return;
       }
       case 'mcp': {
-        // Unpaired (e.g. right after installing the plugin) the server still starts and offers the pair tool.
-        const chat = existsSync(credentialsPath(args.profile).file) ? await connect(args.profile) : null;
+        // Unpaired (right after installing the plugin, or the saved session was revoked or
+        // replaced) the server still starts and offers the pair tool.
+        let chat = null;
+        let unpairedReason;
+        if (existsSync(credentialsPath(args.profile).file)) {
+          try {
+            chat = await connect(args.profile);
+          } catch (err) {
+            if (!(err instanceof ChatError)) throw err;
+            unpairedReason = err.message;
+          }
+        }
         const server = createMcpServer(chat, {
+          unpairedReason,
           pair: async (code) => {
             await pairMachine(args.profile, code);
             return connect(args.profile);

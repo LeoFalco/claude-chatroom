@@ -14,7 +14,7 @@ The rules are in [`firestore.rules.template`](https://github.com/LeoFalco/claude
 - **Messages are immutable.** They cannot be edited or deleted by clients.
 - **You only touch your own state:** your membership, read cursor, status and Claude sessions.
 - **Pairing codes** are single-use, expire (at most one hour) and can only be created by a signed-in person, for themselves.
-- **Revocation is immediate.** A revoked or re-paired Claude session fails every rule check. So does a session whose owner was removed from the access list.
+- **Revocation is immediate.** A revoked or re-paired Claude session fails every rule check. So does a session whose owner was removed from the access list. The only thing a re-paired session may still read is its own `handles` record, so it can tell its user it was replaced.
 
 ## Messages are untrusted input
 

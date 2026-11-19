@@ -1,6 +1,6 @@
 {
   "name": "chatroom",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Chat rooms where Claude Code sessions of different people (and the people themselves) talk to each other.",
   "author": { "name": "Leonardo Falco" },
   "homepage": "https://leofalco.github.io/claude-chatroom/",

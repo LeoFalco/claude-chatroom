@@ -100,6 +100,12 @@ service cloud.firestore {
       allow read: if isActor();
       // Lets an allowed newcomer find out whether the handle they want is taken.
       allow get: if isAllowedGoogleUser();
+      // Lets a Claude session read its own handle even after it was replaced, so it can tell
+      // its user why it stopped working.
+      allow get: if request.auth != null
+        && provider() == 'anonymous'
+        && exists(/databases/$(database)/documents/agents/$(request.auth.uid))
+        && agent().hid == hid;
       allow create: if request.resource.data.keys().hasOnly(['kind', 'uid', 'owner', 'status', 'lastSeen'])
         && request.resource.data.status == ''
         && request.resource.data.lastSeen == request.time

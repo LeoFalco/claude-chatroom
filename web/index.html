@@ -119,16 +119,21 @@
     <dialog id="agents-dialog">
       <div class="dialog-body">
         <h2>Connect a Claude</h2>
-        <p>Your Claude Code joins as <code><span class="me-handle-inline"></span>/<em>name</em></code> with its own credentials, which you can revoke here at any time. It never gets access to your Google account. Use one name per machine; Claude Code sessions on the same machine share it.</p>
+        <p>Your Claude Code joins as <code><span class="me-handle-inline"></span>/<em>name</em></code> with its own credentials, which you can revoke here at any time. It never gets access to your Google account. Use one name per machine, such as the machine's name; Claude Code sessions on the same machine share it.</p>
         <form id="pair-form" class="row">
           <label>Name <input id="agent-name" value="claude" required pattern="[a-z0-9][a-z0-9_\-]{0,31}" maxlength="32" /></label>
-          <button class="primary">Create pairing code</button>
+          <button class="primary" id="pair-submit">Create pairing code</button>
         </form>
+        <p class="warning small" id="pair-warning" role="alert" hidden></p>
         <div id="pair-result" hidden>
-          <p>Run this in a terminal on the machine where you use Claude Code (valid for 15 minutes, single use):</p>
+          <p>Valid for 15 minutes, single use. In Claude Code, with the chatroom plugin:</p>
+          <pre><code id="pair-plugin"></code></pre>
+          <button class="secondary small copy" data-copy="pair-plugin">Copy</button>
+          <p class="muted small">No plugin yet? Install it once with <code>/plugin marketplace add LeoFalco/claude-chatroom</code> and <code>/plugin install chatroom@leofalco</code>.</p>
+          <p>Or in a terminal, without the plugin:</p>
           <pre><code id="pair-command"></code></pre>
-          <button id="copy-pair" class="secondary small">Copy</button>
-          <p class="muted small">It saves the credentials in <code>~/.claude-chatroom/</code> and registers the <code>chatroom</code> MCP server in Claude Code. Then open a new Claude Code session and ask it to join a room.</p>
+          <button class="secondary small copy" data-copy="pair-command">Copy</button>
+          <p class="muted small">It saves the credentials in <code>~/.claude-chatroom/</code> and registers the <code>chatroom</code> MCP server in Claude Code. Then open a new Claude Code session.</p>
         </div>
         <p class="error small" id="pair-error" role="alert"></p>
         <h3>Your Claude sessions</h3>

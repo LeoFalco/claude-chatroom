@@ -314,6 +314,42 @@ test('MCP tools work end to end', { skip }, async () => {
   await bobMcp.close();
 });
 
+test('a replaced session learns why it stopped working', { skip }, async () => {
+  const ana = await human('ana@example.com', 'ana');
+  const first = await agentFor(ana);
+  await first.createRoom('ops');
+  await agentFor(ana); // the same name paired again, e.g. on another machine
+
+  await assert.rejects(new ChatClient(first.fb).init(), /was replaced: "ana\/claude" was paired again/);
+  assert.match(await first.whyDenied(), /was replaced/);
+  // It may read its own handle, nothing else.
+  assert.equal((await first.fb.get('handles/ana~claude')).data.kind, 'agent');
+  await denied(first.fb.get('handles/ana'));
+
+  const server = createMcpServer(first);
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const mcp = new Client({ name: 'test', version: '1.0.0' });
+  await mcp.connect(clientSide);
+  for (const [name, args] of [['list_rooms', {}], ['send_message', { room: 'ops', text: 'hi' }]]) {
+    const r = await mcp.callTool({ name, arguments: args });
+    assert.ok(r.isError, name);
+    assert.match(r.content[0].text, /was replaced: "ana\/claude" was paired again.*Pair this machine again/, name);
+  }
+  await mcp.close();
+
+  // Started with saved credentials that no longer work: the reason shows up until it pairs again.
+  const unpaired = createMcpServer(null, { unpairedReason: 'This Claude session was replaced.' });
+  const [c2, s2] = InMemoryTransport.createLinkedPair();
+  await unpaired.connect(s2);
+  const mcp2 = new Client({ name: 'test', version: '1.0.0' });
+  await mcp2.connect(c2);
+  assert.match(mcp2.getInstructions(), /not paired, so only whoami and pair work\. This Claude session was replaced\. Ask your user/);
+  const who = await mcp2.callTool({ name: 'whoami', arguments: {} });
+  assert.equal(who.content[0].text, 'This Claude session was replaced. Then run /chatroom:pair <code>.');
+  await mcp2.close();
+});
+
 test('an unpaired MCP server starts, pairs through the pair tool and then works', { skip }, async () => {
   const ana = await human('ana@example.com', 'ana');
   const code = await createPairing(ana, 'plugin');
@@ -336,7 +372,7 @@ test('an unpaired MCP server starts, pairs through the pair tool and then works'
     return { text: r.content.map((x) => x.text).join('\n'), isError: Boolean(r.isError) };
   };
 
-  assert.match(mcp.getInstructions(), /not paired yet/);
+  assert.match(mcp.getInstructions(), /not paired, so only whoami and pair work\. Ask your user/);
   assert.doesNotMatch(mcp.getInstructions(), /\{handle\}|\{owner\}|\{identity\}/);
   assert.match((await call('whoami')).text, /Not paired yet/);
   const early = await call('list_rooms');

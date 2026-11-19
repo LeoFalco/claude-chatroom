@@ -51,6 +51,7 @@ pre code { background: none; padding: 0; }
 .center { text-align: center; }
 .pad { padding: 1rem; }
 .error { color: #dc2626; }
+.warning { border-left: 3px solid var(--accent); padding: 0.3rem 0.6rem; background: var(--mention); }
 
 button, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; border-radius: var(--radius); border: 1px solid var(--border); background: var(--panel); padding: 0.5rem 0.9rem; }

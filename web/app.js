@@ -592,10 +592,29 @@ $('#room-form').addEventListener('submit', async (e) => {
 // ---- Claude sessions --------------------------------------------------------------
 
 let agentsUnsub = null;
+let pairedAgents = []; // sessions currently holding their name
+let suggestAgentName = false;
+
+/** First free agent name: "claude", then "claude-2", "claude-3"… */
+function freeAgentName() {
+  const taken = new Set(pairedAgents.map((a) => a.agent));
+  if (!taken.has('claude')) return 'claude';
+  let n = 2;
+  while (taken.has(`claude-${n}`)) n++;
+  return `claude-${n}`;
+}
+
+function disarmPairing() {
+  $('#pair-warning').hidden = true;
+  delete $('#pair-submit').dataset.armed;
+  $('#pair-submit').textContent = 'Create pairing code';
+}
 
 $('#open-agents').addEventListener('click', () => {
   $('#pair-result').hidden = true;
   $('#pair-error').textContent = '';
+  disarmPairing();
+  suggestAgentName = true;
   $('#agents-dialog').showModal();
   agentsUnsub?.();
   agentsUnsub = onSnapshot(query(collection(db, 'agents'), where('owner', '==', state.user.uid)), (snap) => {
@@ -608,6 +627,11 @@ $('#open-agents').addEventListener('click', () => {
       .filter((a) => !a.revoked)
       .map((a) => ({ ...a, current: state.handles.get(a.hid)?.uid === a.uid }))
       .sort((a, b) => a.hid.localeCompare(b.hid) || Number(b.current) - Number(a.current));
+    pairedAgents = agents.filter((a) => a.current);
+    if (suggestAgentName) {
+      suggestAgentName = false;
+      $('#agent-name').value = freeAgentName();
+    }
     for (const a of agents) {
       const h = state.handles.get(a.hid) ?? {};
       const detail = a.current ? ` · paired ${timeLabel(a.createdAt)} · ${ago(h.lastSeen)}` : ` · replaced, paired ${timeLabel(a.createdAt)}`;
@@ -656,6 +680,18 @@ $('#pair-form').addEventListener('submit', async (e) => {
   $('#pair-error').textContent = '';
   const agent = $('#agent-name').value.trim().toLowerCase();
   if (!NAME_RE.test(agent)) return ($('#pair-error').textContent = 'Use 1-32 chars: a-z, 0-9, "-" or "_".');
+  // Redeeming a code for a name in use cuts the session holding it off, so ask first.
+  const holder = pairedAgents.find((a) => a.agent === agent);
+  if (holder && !$('#pair-submit').dataset.armed) {
+    const last = ago(state.handles.get(holder.hid)?.lastSeen);
+    $('#pair-warning').textContent =
+      `${hidToHandle(holder.hid)} is already paired (${last}). Using a code with this name cuts that session off. ` +
+      `To keep it, use another name such as "${freeAgentName()}"; to replace it, click "Replace session".`;
+    $('#pair-warning').hidden = false;
+    $('#pair-submit').dataset.armed = '1';
+    $('#pair-submit').textContent = 'Replace session';
+    return;
+  }
   const code = newId(32);
   try {
     await setDoc(doc(db, 'pairings', code), {
@@ -672,14 +708,20 @@ $('#pair-form').addEventListener('submit', async (e) => {
   }
   const pairing = 'ccr1.' + btoa(JSON.stringify({ p: config.projectId, k: config.apiKey, c: code })).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
   const profile = agent === 'claude' ? '' : ` --profile ${agent}`;
+  $('#pair-plugin').textContent = `/chatroom:pair ${pairing}`;
   $('#pair-command').textContent = `npm install -g ${packageSpec}\nclaude-chatroom pair ${pairing}${profile}`;
   $('#pair-result').hidden = false;
+  disarmPairing();
 });
 
-$('#copy-pair').addEventListener('click', async () => {
-  await navigator.clipboard.writeText($('#pair-command').textContent);
-  toast('Copied.');
-});
+$('#agent-name').addEventListener('input', disarmPairing);
+
+for (const btn of document.querySelectorAll('button.copy')) {
+  btn.addEventListener('click', async () => {
+    await navigator.clipboard.writeText($(`#${btn.dataset.copy}`).textContent);
+    toast('Copied.');
+  });
+}
 
 $('#toggle-sidebar').addEventListener('click', () => document.body.classList.toggle('sidebar-open'));
 

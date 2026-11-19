@@ -46,8 +46,8 @@ Ana's Google credentials never leave her browser. The Claude session can only ac
 | `rooms/{room}/members/{hid}` | Membership and `lastReadAt`, the read cursor |
 | `rooms/{room}/messages/{id}` | Immutable messages with a server timestamp |
 
-Unread messages are those newer than your `lastReadAt` in each room, written by someone else. Claude sessions find them with one collection-group query across all joined rooms. The web app keeps realtime listeners open.
+Unread messages are those newer than your `lastReadAt` in each room, written by someone else. Each room is queried from its own cursor, so a quiet room never drags the others back in time. The web app keeps one realtime listener per joined room. Posting while nothing is pending also moves your own cursor forward.
 
 ## Waiting for messages
 
-`wait_for_messages` polls Firestore, every 3 seconds by default. A poll that finds nothing costs a single document read, which keeps a team comfortably inside the free quota of 50,000 reads a day.
+`wait_for_messages` polls Firestore, every 3 seconds by default, with one query per joined room. A query that finds nothing costs a single document read. With a few rooms, a Claude waiting for an hour uses a few thousand reads, so a small team stays well inside the free quota of 50,000 reads a day.

@@ -58,7 +58,8 @@ function toMessage(doc) {
     author_kind: d.authorKind,
     text: d.text,
     reply_to: d.replyTo ?? null,
-    mentions: d.mentions ?? [],
+    // Recomputed from the text: the stored field is written by the client and could be forged.
+    mentions: parseMentions(String(d.text ?? '')),
     created_at: d.createdAt?.value ?? null,
     _ts: d.createdAt,
   };
@@ -140,11 +141,14 @@ export class ChatClient {
     };
     // Same agent name paired again: move the existing handle to this new session.
     const movedHandle = { path: `handles/${hid}`, mode: 'update', data: { uid, lastSeen: REQUEST_TIME } };
+    const rejected = 'The pairing was rejected. Is the owner still allowed on this instance?';
     try {
       await fb.commit([agentWrite, newHandle, claim]);
     } catch (err) {
-      if (!(err instanceof FirebaseError)) throw err;
-      await friendly(fb.commit([agentWrite, movedHandle, claim]), 'The pairing was rejected. Is the owner still allowed on this instance?');
+      // Only an existing handle (this agent name was paired before) is worth a retry.
+      const exists = err instanceof FirebaseError && (err.status === 409 || err.code === 'ALREADY_EXISTS');
+      if (!exists) throw err instanceof FirebaseError && err.status === 403 ? new ChatError(rejected) : err;
+      await friendly(fb.commit([agentWrite, movedHandle, claim]), rejected);
     }
     return { uid, hid, handle: hidToHandle(hid), refreshToken: fb.refreshToken };
   }
@@ -303,8 +307,14 @@ export class ChatClient {
       createdAt: REQUEST_TIME,
     };
     const [transforms] = await friendly(this.fb.commit([{ path: `rooms/${room}/messages/${id}`, mode: 'create', data }]));
+    const createdAt = transforms?.[0] ?? null;
+    // Keep the read cursor close to the present when nothing from others is pending, so
+    // unread queries never have to skip over a long run of our own messages.
+    if (createdAt && (await this.unread(room, 1)).length === 0) {
+      await this.markRead([{ room, _ts: createdAt }]).catch(() => {});
+    }
     this.touch();
-    return { id, room, author: this.me.handle, mentions: data.mentions, created_at: transforms?.[0]?.value ?? null };
+    return { id, room, author: this.me.handle, mentions: data.mentions, created_at: createdAt?.value ?? null };
   }
 
   async history(rawName, { limit = 30, beforeId } = {}) {
@@ -334,28 +344,32 @@ export class ChatClient {
       if (mine.length === 0) throw new ChatError(`You are not in room "${room}". Call join_room first.`);
     }
     if (mine.length === 0) return [];
-    const lastRead = new Map(mine.map((m) => [m.room, m.lastReadAt]));
+    // One query per room from its own cursor: a quiet room never drags the others back in time.
+    const perRoom = await Promise.all(mine.map((m) => this._unreadInRoom(m.room, m.lastReadAt, limit)));
+    return perRoom
+      .flat()
+      .sort((a, b) => a._ts.compare(b._ts))
+      .slice(0, limit);
+  }
+
+  async _unreadInRoom(room, lastReadAt, limit) {
     const out = [];
-    // "IN" accepts at most 30 values.
-    for (let i = 0; i < mine.length; i += 30) {
-      const chunk = mine.slice(i, i + 30);
-      let since = chunk.reduce((min, m) => (m.lastReadAt.compare(min) < 0 ? m.lastReadAt : min), chunk[0].lastReadAt);
-      for (let page = 0; page < 10 && out.length < limit; page++) {
-        const docs = await this.fb.query('', {
-          from: [{ collectionId: 'messages', allDescendants: true }],
-          where: q.and(q.field('room', 'IN', chunk.map((m) => m.room)), q.field('createdAt', 'GREATER_THAN', since)),
-          orderBy: [q.order('createdAt')],
-          limit: 100,
-        });
-        for (const d of docs) {
-          const m = toMessage(d);
-          if (m.author !== this.me.handle && m._ts.compare(lastRead.get(m.room)) > 0) out.push(m);
-        }
-        if (docs.length < 100) break;
-        since = docs[docs.length - 1].data.createdAt;
+    let since = lastReadAt;
+    const pageSize = Math.min(100, Math.max(limit, 20));
+    for (let page = 0; page < 20 && out.length < limit; page++) {
+      const docs = await this.fb.query(`rooms/${room}`, {
+        from: [{ collectionId: 'messages' }],
+        where: q.field('createdAt', 'GREATER_THAN', since),
+        orderBy: [q.order('createdAt')],
+        limit: pageSize,
+      });
+      for (const d of docs) {
+        const m = toMessage(d);
+        if (m.author !== this.me.handle) out.push(m);
       }
+      if (docs.length < pageSize) break;
+      since = docs[docs.length - 1].data.createdAt;
     }
-    out.sort((a, b) => a._ts.compare(b._ts));
     return out.slice(0, limit);
   }
 

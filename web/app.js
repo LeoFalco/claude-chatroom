@@ -63,7 +63,7 @@ const state = {
   handles: new Map(), // hid -> { status, lastSeen, kind }
   unsubs: [],
   roomUnsubs: [],
-  unreadUnsub: null,
+  unreadWatch: new Map(), // room -> { since, unsub }
 };
 
 $('#docs-link').href = docsUrl;
@@ -213,7 +213,7 @@ $('#handle-form').addEventListener('submit', async (e) => {
 
 function teardown() {
   for (const u of [...state.unsubs, ...state.roomUnsubs]) u();
-  state.unreadUnsub?.();
+  for (const w of state.unreadWatch.values()) w.unsub();
   Object.assign(state, {
     me: null,
     rooms: new Map(),
@@ -225,7 +225,7 @@ function teardown() {
     handles: new Map(),
     unsubs: [],
     roomUnsubs: [],
-    unreadUnsub: null,
+    unreadWatch: new Map(),
   });
 }
 
@@ -271,35 +271,44 @@ function touch() {
   updateDoc(doc(db, 'handles', state.me.hid), { lastSeen: serverTimestamp() }).catch(() => {});
 }
 
-/** One listener for unread counts across all joined rooms. */
+/**
+ * Unread counts: one listener per joined room, from that room's own read cursor. A listener
+ * is only replaced when its room's cursor moves, so reading one room doesn't re-read others.
+ */
 function watchUnread() {
-  state.unreadUnsub?.();
-  state.unreadUnsub = null;
-  const rooms = [...state.memberships.keys()].slice(0, 30);
-  if (rooms.length === 0) {
-    state.unread = new Map();
-    return renderRooms();
+  for (const [room, w] of state.unreadWatch) {
+    if (!state.memberships.has(room)) {
+      w.unsub();
+      state.unreadWatch.delete(room);
+      state.unread.delete(room);
+    }
   }
-  const since = rooms.map((r) => state.memberships.get(r)).reduce((a, b) => (a.toMillis() <= b.toMillis() ? a : b));
-  const q = query(collectionGroup(db, 'messages'), where('room', 'in', rooms), where('createdAt', '>', since), orderBy('createdAt'), limit(500));
-  state.unreadUnsub = onSnapshot(
-    q,
-    (snap) => {
-      const counts = new Map();
-      for (const d of snap.docs) {
-        const m = d.data();
-        const lastRead = state.memberships.get(m.room);
-        if (m.authorHid === state.me.hid || !m.createdAt || !lastRead || m.createdAt.toMillis() <= lastRead.toMillis()) continue;
-        const prev = counts.get(m.room) ?? { n: 0, mention: false };
-        counts.set(m.room, { n: prev.n + 1, mention: prev.mention || mentionsMe(m.mentions ?? []) });
-      }
-      state.unread = counts;
-      renderRooms();
-      const total = [...counts.values()].reduce((s, c) => s + c.n, 0);
-      document.title = total ? `(${total}) Claude Chatroom` : 'Claude Chatroom';
-    },
-    (err) => console.warn('unread listener', err),
-  );
+  for (const [room, lastReadAt] of state.memberships) {
+    const since = lastReadAt ?? Timestamp.fromMillis(0);
+    const current = state.unreadWatch.get(room);
+    if (current && current.since.isEqual(since)) continue;
+    current?.unsub();
+    const q = query(collection(db, 'rooms', room, 'messages'), where('createdAt', '>', since), orderBy('createdAt'), limit(100));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        let n = 0;
+        let mention = false;
+        for (const d of snap.docs) {
+          const m = d.data();
+          if (m.authorHid === state.me.hid) continue;
+          n++;
+          mention ||= mentionsMe(parseMentions(m.text ?? ''));
+        }
+        if (n) state.unread.set(room, { n, mention, more: snap.size === 100 });
+        else state.unread.delete(room);
+        renderRooms();
+      },
+      (err) => console.warn('unread listener', room, err),
+    );
+    state.unreadWatch.set(room, { since, unsub });
+  }
+  renderRooms();
 }
 
 function renderRooms() {
@@ -325,12 +334,14 @@ function renderRooms() {
             },
           },
           el('span', {}, `# ${name}`),
-          showBadge ? el('span', { class: u.mention ? 'badge mention' : 'badge' }, String(u.n)) : null,
+          showBadge ? el('span', { class: u.mention ? 'badge mention' : 'badge' }, u.more ? `${u.n}+` : String(u.n)) : null,
         ),
       ),
     );
   }
   if (names.length === 0) list.append(el('li', { class: 'muted small pad' }, 'No rooms yet.'));
+  const total = [...state.unread].filter(([room]) => room !== state.current).reduce((s, [, c]) => s + c.n, 0);
+  document.title = total ? `(${total}) Claude Chatroom` : 'Claude Chatroom';
 }
 
 function openRoom(name) {
@@ -396,7 +407,7 @@ function renderMessages() {
       el(
         'article',
         {
-          class: ['msg', grouped && 'grouped', isAgent && 'agent', m.authorHid === state.me.hid && 'mine', m.authorHid !== state.me.hid && mentionsMe(m.mentions ?? []) && 'mentions-me', m.pending && 'pending']
+          class: ['msg', grouped && 'grouped', isAgent && 'agent', m.authorHid === state.me.hid && 'mine', m.authorHid !== state.me.hid && mentionsMe(parseMentions(m.text ?? '')) && 'mentions-me', m.pending && 'pending']
             .filter(Boolean)
             .join(' '),
           id: `m-${m.id}`,
@@ -590,17 +601,21 @@ $('#open-agents').addEventListener('click', () => {
   agentsUnsub = onSnapshot(query(collection(db, 'agents'), where('owner', '==', state.user.uid)), (snap) => {
     const list = $('#agent-list');
     list.replaceChildren();
+    // Replaced sessions (same name paired again) can no longer act, but are listed so their
+    // records can be revoked too.
     const agents = snap.docs
       .map((d) => ({ uid: d.id, ...d.data() }))
-      .filter((a) => !a.revoked && state.handles.get(a.hid)?.uid === a.uid)
-      .sort((a, b) => a.hid.localeCompare(b.hid));
+      .filter((a) => !a.revoked)
+      .map((a) => ({ ...a, current: state.handles.get(a.hid)?.uid === a.uid }))
+      .sort((a, b) => a.hid.localeCompare(b.hid) || Number(b.current) - Number(a.current));
     for (const a of agents) {
       const h = state.handles.get(a.hid) ?? {};
+      const detail = a.current ? ` · paired ${timeLabel(a.createdAt)} · ${ago(h.lastSeen)}` : ` · replaced, paired ${timeLabel(a.createdAt)}`;
       list.append(
         el(
           'li',
           { class: 'row' },
-          el('span', {}, el('strong', {}, hidToHandle(a.hid)), el('span', { class: 'muted small' }, ` · paired ${timeLabel(a.createdAt)} · ${ago(h.lastSeen)}`)),
+          el('span', {}, el('strong', {}, hidToHandle(a.hid)), el('span', { class: 'muted small' }, detail)),
           el(
             'button',
             {

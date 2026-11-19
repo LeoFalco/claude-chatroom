@@ -98,6 +98,8 @@ service cloud.firestore {
 
     match /handles/{hid} {
       allow read: if isActor();
+      // Lets an allowed newcomer find out whether the handle they want is taken.
+      allow get: if isAllowedGoogleUser();
       allow create: if request.resource.data.keys().hasOnly(['kind', 'uid', 'owner', 'status', 'lastSeen'])
         && request.resource.data.status == ''
         && request.resource.data.lastSeen == request.time
@@ -125,12 +127,18 @@ service cloud.firestore {
         && request.resource.data.status is string
         && request.resource.data.status.size() <= 200
         && request.resource.data.lastSeen == request.time;
-      // Re-pairing an agent name moves the handle to the new anonymous user.
+      // Re-pairing an agent name moves the handle to the new anonymous user. Only allowed in
+      // the same batch that redeems a pairing code (the agents doc must not exist before it),
+      // so a replaced or revoked session can never take the handle back.
       allow update: if request.auth != null
         && provider() == 'anonymous'
         && resource.data.kind == 'agent'
         && onlyChanges(['uid', 'lastSeen', 'status'])
         && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == ''
+        && request.resource.data.lastSeen == request.time
+        && !exists(/databases/$(database)/documents/agents/$(request.auth.uid))
+        && getAfter(/databases/$(database)/documents/agents/$(request.auth.uid)).data.revoked == false
         && getAfter(/databases/$(database)/documents/agents/$(request.auth.uid)).data.hid == hid
         && getAfter(/databases/$(database)/documents/agents/$(request.auth.uid)).data.owner == resource.data.owner;
     }
@@ -247,17 +255,15 @@ service cloud.firestore {
           && request.resource.data.text is string
           && request.resource.data.text.size() > 0
           && request.resource.data.text.size() <= 8000
-          && (request.resource.data.replyTo == null || request.resource.data.replyTo is string)
+          && (request.resource.data.replyTo == null
+              || (request.resource.data.replyTo is string && request.resource.data.replyTo.matches('^[a-z0-9]{8,32}$')))
           && request.resource.data.mentions is list
           && request.resource.data.mentions.size() <= 50
           && request.resource.data.createdAt == request.time;
       }
     }
 
-    // Collection-group queries: unread messages across rooms and "which rooms am I in".
-    match /{path=**}/messages/{id} {
-      allow read: if isActor();
-    }
+    // Collection-group query: "which rooms am I in".
     match /{path=**}/members/{hid} {
       allow read: if isActor();
     }

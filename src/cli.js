@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, accessSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,13 +61,22 @@ function mcpCommand(profile) {
   return process.platform === 'win32' ? ['cmd', '/c', ...npx] : npx;
 }
 
+/**
+ * Runs the Claude Code CLI. No shell, so paths with spaces survive; on Windows an npm-installed
+ * `claude.cmd` cannot run without one, so fall back to a fully quoted command line.
+ */
+function runClaude(args, stdio) {
+  const r = spawnSync('claude', args, { stdio });
+  if (r.error?.code !== 'ENOENT' || process.platform !== 'win32') return r;
+  return spawnSync(['claude', ...args].map(quote).join(' '), { stdio, shell: true });
+}
+
 function registerWithClaude(profile) {
   const name = profile === 'default' ? 'chatroom' : `chatroom-${profile}`;
   const cmd = mcpCommand(profile);
   const args = ['mcp', 'add', '--scope', 'user', name, '--', ...cmd];
-  const shell = process.platform === 'win32';
-  spawnSync('claude', ['mcp', 'remove', '--scope', 'user', name], { stdio: 'ignore', shell });
-  const r = spawnSync('claude', args, { stdio: 'inherit', shell });
+  runClaude(['mcp', 'remove', '--scope', 'user', name], 'ignore');
+  const r = runClaude(args, 'inherit');
   if (r.status !== 0) {
     console.log(`\nCould not run "claude mcp add". Register it yourself:\n  claude ${args.map(quote).join(' ')}`);
     return false;
@@ -77,14 +86,14 @@ function registerWithClaude(profile) {
 }
 
 function quote(a) {
-  return /[\s"]/.test(a) ? `"${a.replaceAll('"', '\\"')}"` : a;
+  return /[\s"&|<>^()]/.test(a) ? `"${a.replaceAll('"', '\\"')}"` : a;
 }
 
 function parseArgs(argv) {
   const args = { _: [], profile: 'default', register: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--profile') args.profile = argv[++i];
+    if (a === '--profile') args.profile = argv[++i] ?? '';
     else if (a === '--no-register') args.register = false;
     else if (a === '-h' || a === '--help') args.help = true;
     else if (a === '-v' || a === '--version') args.version = true;
@@ -104,6 +113,10 @@ export async function main(argv = process.argv.slice(2)) {
       case 'pair': {
         if (!rest[0]) throw new ChatError('Missing pairing code. Create one in the web UI ("Connect a Claude").');
         const { projectId, apiKey, code } = decodePairing(rest[0]);
+        // Check everything that could fail locally before the single-use code is consumed.
+        const { dir } = credentialsPath(args.profile);
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        accessSync(dir, constants.W_OK);
         const fb = new FirebaseClient({ projectId, apiKey });
         const paired = await ChatClient.pair(fb, code);
         const file = saveCredentials(args.profile, { projectId, apiKey, uid: paired.uid, handle: paired.handle, refreshToken: paired.refreshToken });

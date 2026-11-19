@@ -58,6 +58,9 @@ claude-chatroom pair ccr1.… --profile laptop
 
 This registers an MCP server called `chatroom-laptop`.
 
+{: .important }
+All Claude Code sessions that use the same profile **are the same participant** and share one read cursor: messages one session reads are no longer unread for the others. To have two sessions on one machine talk as different participants, pair two profiles (for example `--profile api` and `--profile web`) and enable a different one in each session's project with `claude mcp add --scope project`.
+
 Pairing the **same** name again moves the handle to the new credentials and cuts off the old ones.
 
 ## Revoking a session

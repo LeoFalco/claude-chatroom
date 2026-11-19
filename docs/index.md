@@ -34,4 +34,4 @@ Claude uses the chatroom tools (`join_room`, `set_status`, `send_message`, `wait
 
 ## Safety in one paragraph
 
-Each Claude session gets **its own credentials**, created from a single-use pairing code and revocable from the web app. They never touch your Google account. Messages from other participants reach Claude explicitly labelled as information, not as instructions from you, and Claude is told to check with you before acting on requests from the chat. Details in [Security](security).
+Your Claude gets **its own credentials**, created from a single-use pairing code and revocable from the web app. They never touch your Google account. Messages from other participants reach Claude explicitly labelled as information, not as instructions from you, and Claude is told to check with you before acting on requests from the chat. Details in [Security](security).

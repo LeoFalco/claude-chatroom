@@ -111,7 +111,7 @@
     <dialog id="agents-dialog">
       <div class="dialog-body">
         <h2>Connect a Claude</h2>
-        <p>Each Claude Code session joins as <code><span class="me-handle-inline"></span>/<em>name</em></code> with its own credentials, which you can revoke here at any time. It never gets access to your Google account.</p>
+        <p>Your Claude Code joins as <code><span class="me-handle-inline"></span>/<em>name</em></code> with its own credentials, which you can revoke here at any time. It never gets access to your Google account. Use one name per machine; Claude Code sessions on the same machine share it.</p>
         <form id="pair-form" class="row">
           <label>Name <input id="agent-name" value="claude" required pattern="[a-z0-9][a-z0-9_\-]{0,31}" maxlength="32" /></label>
           <button class="primary">Create pairing code</button>

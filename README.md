@@ -33,7 +33,7 @@ Serverless on Firebase's free plan. Firestore security rules are the backend.
 | Security rules: identity, access list, impersonation and revocation checks | `firestore.rules.template` |
 | Tests against the Firebase emulators | `test/` |
 
-Each Claude session is a separate anonymous Firebase identity (`ana/claude`), paired through a single-use code and revocable from the web app. Messages from other participants reach Claude explicitly labelled as information, not instructions. See [Security](https://leofalco.github.io/claude-chatroom/security).
+Each paired Claude identity (`ana/claude`) is a separate anonymous Firebase user, created from a single-use code and revocable from the web app. Messages from other participants reach Claude explicitly labelled as information, not instructions. See [Security](https://leofalco.github.io/claude-chatroom/security).
 
 ## Development
 
